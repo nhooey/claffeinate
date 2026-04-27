@@ -13,7 +13,15 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-CLAFF="${CLAFFEINATE_BIN:-${ROOT_DIR}/bin/claffeinate.sh}"
+# CLAFF is an array so we can invoke claffeinate.sh through `bash` rather
+# than relying on the kernel to exec the script directly. Some sandboxes
+# (Garnix Darwin) block exec on the build volume even though writes are
+# fine; bash-as-loader bypasses that.
+if [ -n "${CLAFFEINATE_BIN:-}" ]; then
+  CLAFF=("$CLAFFEINATE_BIN")
+else
+  CLAFF=(bash "${ROOT_DIR}/bin/claffeinate.sh")
+fi
 
 # RUN_DIR mirrors the script's: defaults to /tmp/claffeinate/, but can be
 # overridden via $CLAFFEINATE_RUN_DIR for sandboxed CI. Trailing "/" required.
@@ -64,10 +72,10 @@ have_live_claude() {
 
 cleanup() {
   TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" kill-mine >/dev/null 2>&1 || true
+    "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
   if [ -n "$REAL_TERM_SID" ] && [ -n "$REAL_SSE_PORT" ]; then
     TERM_SESSION_ID="$REAL_TERM_SID" CLAUDE_CODE_SSE_PORT="$REAL_SSE_PORT" \
-      "$CLAFF" kill-mine >/dev/null 2>&1 || true
+      "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
   fi
   # Reap any leftover test fakes by tag pattern.
   pkill -f -- "caffeinate--claffeinate--tab-${TEST_TERM_SID}-" 2>/dev/null || true
@@ -88,13 +96,13 @@ trap cleanup EXIT
 test_start_idempotent() {
   local out1 out2 tagged_count
   out1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" start 2>&1) || {
+    "${CLAFF[@]}" start 2>&1) || {
     fail start_idempotent "first start failed: $out1"
     return
   }
   sleep 0.3
   out2=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" start 2>&1) || {
+    "${CLAFF[@]}" start 2>&1) || {
     fail start_idempotent "second start failed: $out2"
     return
   }
@@ -116,7 +124,7 @@ test_start_idempotent() {
 test_list_shows_instance() {
   local out
   out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" list 2>&1)
+    "${CLAFF[@]}" list 2>&1)
   if printf '%s' "$out" | awk -F'\t' -v sid="$TEST_TERM_SID" -v port="$TEST_SSE_PORT" '
        $2 == sid && $3 == port { found = 1 }
        END { exit !found }
@@ -133,13 +141,13 @@ test_list_shows_instance() {
 test_kill_mine() {
   local out tag
   TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" kill-mine >/dev/null 2>&1 || {
+    "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || {
     fail kill_mine "kill-mine returned non-zero"
     return
   }
   sleep 0.4
   out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" list 2>&1)
+    "${CLAFF[@]}" list 2>&1)
   if printf '%s' "$out" | awk -F'\t' -v sid="$TEST_TERM_SID" -v port="$TEST_SSE_PORT" '
        $2 == sid && $3 == port { found = 1 }
        END { exit found ? 1 : 0 }
@@ -173,18 +181,18 @@ test_kill_orphans_alive_noop() {
   # Start with the REAL env so this instance is bound to the live claude.
   local out
   out=$(TERM_SESSION_ID="$REAL_TERM_SID" CLAUDE_CODE_SSE_PORT="$REAL_SSE_PORT" \
-    "$CLAFF" start 2>&1) || {
+    "${CLAFF[@]}" start 2>&1) || {
     fail kill_orphans_alive_noop "start failed: $out"
     return
   }
   sleep 0.3
   out=$(TERM_SESSION_ID="$REAL_TERM_SID" CLAUDE_CODE_SSE_PORT="$REAL_SSE_PORT" \
-    "$CLAFF" kill-orphans --dry-run 2>&1) || true
+    "${CLAFF[@]}" kill-orphans --dry-run 2>&1) || true
   local matched
   matched=$(printf '%s\n' "$out" | grep -c "tab-${REAL_TERM_SID}-${REAL_SSE_PORT}--" || true)
   # Clean up first
   TERM_SESSION_ID="$REAL_TERM_SID" CLAUDE_CODE_SSE_PORT="$REAL_SSE_PORT" \
-    "$CLAFF" kill-mine >/dev/null 2>&1 || true
+    "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
   if [ "$matched" -gt 0 ]; then
     fail kill_orphans_alive_noop "dry-run flagged our live instance: $out"
     return
@@ -201,8 +209,12 @@ test_kill_orphans_reaps_fakes() {
   local fake_dir="orphandir"
   local tag="caffeinate--claffeinate--tab-${fake_sid}-${fake_port}--dir-${fake_dir}"
   mkdir -p "$RUN_DIR" "$TAG_DIR"
+  # Symlink is the kill-orphans cleanup target. We don't exec it -- some
+  # sandboxes (Garnix Darwin runners) block exec on the build volume.
+  # Use `exec -a` to set argv[0] to the symlink path, which is what
+  # tag_for_pid / pgrep -f match against.
   ln -sf /bin/sleep "${TAG_DIR}${tag}"
-  "${TAG_DIR}${tag}" 600 &
+  (exec -a "${TAG_DIR}${tag}" /bin/sleep 600) &
   local fake_pid=$!
   printf '%s\n' "$fake_pid" >"${RUN_DIR}${tag}.pid"
   disown "$fake_pid" 2>/dev/null || true
@@ -215,7 +227,7 @@ test_kill_orphans_reaps_fakes() {
 
   local out
   out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" kill-orphans 2>&1) || true
+    "${CLAFF[@]}" kill-orphans 2>&1) || true
   sleep 0.3
 
   # Reap our own backgrounded child if it's already exited so kill -0 below
@@ -248,7 +260,7 @@ test_claude_pid_resolves() {
     return
   fi
   local pid comm
-  pid=$("$CLAFF" claude-pid --term-session-id "$REAL_TERM_SID" --sse-port "$REAL_SSE_PORT" 2>&1) || {
+  pid=$("${CLAFF[@]}" claude-pid --term-session-id "$REAL_TERM_SID" --sse-port "$REAL_SSE_PORT" 2>&1) || {
     fail claude_pid_resolves "claude-pid failed: $pid"
     return
   }
@@ -270,7 +282,7 @@ test_json_parses() {
   fi
   local json
   json=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" list --json 2>&1) || {
+    "${CLAFF[@]}" list --json 2>&1) || {
     fail json_parses "list --json failed: $json"
     return
   }
@@ -296,7 +308,7 @@ EOF
 
   out=$(PATH="${stub_dir}:${PATH}" TERM_SESSION_ID="$TEST_TERM_SID" \
     CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "$CLAFF" list --json 2>&1)
+    "${CLAFF[@]}" list --json 2>&1)
   rc=$?
   rm -rf "$stub_dir"
 
@@ -325,20 +337,20 @@ test_short_options() {
   short_port="$(printf '65%03d' $((RANDOM % 1000)))"
   local out long_out short_out
   out=$(TERM_SESSION_ID="$short_sid" CLAUDE_CODE_SSE_PORT="$short_port" \
-    "$CLAFF" start -d 2>&1) || {
+    "${CLAFF[@]}" start -d 2>&1) || {
     fail short_options "start -d failed: $out"
     return
   }
   sleep 0.3
   long_out=$(TERM_SESSION_ID="$short_sid" CLAUDE_CODE_SSE_PORT="$short_port" \
-    "$CLAFF" list 2>&1)
+    "${CLAFF[@]}" list 2>&1)
   short_out=$(TERM_SESSION_ID="$short_sid" CLAUDE_CODE_SSE_PORT="$short_port" \
-    "$CLAFF" list -j 2>&1) || {
+    "${CLAFF[@]}" list -j 2>&1) || {
     fail short_options "list -j failed: $short_out"
     return
   }
   TERM_SESSION_ID="$short_sid" CLAUDE_CODE_SSE_PORT="$short_port" \
-    "$CLAFF" kill-mine >/dev/null 2>&1 || true
+    "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
   pkill -f -- "caffeinate--claffeinate--tab-${short_sid}-" 2>/dev/null || true
   if ! printf '%s' "$long_out" | grep -q "$short_sid"; then
     fail short_options "list (no flags) missing instance: $long_out"

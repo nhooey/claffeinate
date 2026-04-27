@@ -271,6 +271,12 @@ cmd_start() {
     printf "error: caffeinate not found on PATH\n" >&2
     return 1
   fi
+  # The symlink stays as a kill-mine fallback marker (its presence /
+  # removal is part of the contract), but we never exec it -- some
+  # sandboxes (notably Garnix's macOS build runner) block exec on the
+  # build volume even though writes are fine. Instead, exec the real
+  # caffeinate(1) and override argv[0] with the symlink path via
+  # `exec -a`, which gives the same observable tag in `ps`/`pgrep`.
   ln -sf "$caffeinate_bin" "$symlink"
 
   local logfile="${RUN_DIR}${tag}.log"
@@ -278,10 +284,10 @@ cmd_start() {
   local heartbeat='while true; do printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$PWD"; sleep 60; done'
 
   if [ -n "$timeout" ]; then
-    "$symlink" "-${short_flags}" -t "$timeout" sh -c "$heartbeat" \
+    (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" -t "$timeout" sh -c "$heartbeat") \
       >"$logfile" 2>&1 &
   else
-    "$symlink" "-${short_flags}" sh -c "$heartbeat" \
+    (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" sh -c "$heartbeat") \
       >"$logfile" 2>&1 &
   fi
   local pid=$!
