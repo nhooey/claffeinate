@@ -2,9 +2,10 @@
 
 [![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fnhooey%2Fclaffeinate)](https://garnix.io/repo/nhooey/claffeinate)
 
-A small Bash wrapper around `caffeinate(1)` that tags each instance with the
-Claude Code tab that owns it. Multi-tab workflows can detect and reap orphans
-(instances whose Claude tab has died) without killing each other's instances.
+A small Bash wrapper around [`caffeinate(1)`][caffeinate-man] (the macOS
+utility that keeps your Mac awake) that tags each instance with the Claude
+Code tab that owns it. Multi-tab workflows can detect and reap orphans (instances whose Claude
+tab has died) without killing each other's instances.
 
 macOS only. Bash 3.2+. Zero external dependencies beyond macOS built-ins;
 `jq` is required only when `--json` is requested.
@@ -38,8 +39,8 @@ claffeinate --help
 
 ## How tagging works
 
-Every `claffeinate start` creates a uniquely-named symlink to `caffeinate` and
-exec's that symlink. The symlink's name encodes the tab identifier, so the
+Every `claffeinate start` creates a uniquely-named symlink to
+[`caffeinate`][caffeinate-man] and exec's that symlink. The symlink's name encodes the tab identifier, so the
 process appears in `ps` and `pgrep` under a name like:
 
 ```
@@ -179,3 +180,5 @@ Tests run inside Claude Code (they need a real `TERM_SESSION_ID` and
 `CLAUDE_CODE_SSE_PORT` to verify the `claude-pid` resolver). They use
 synthetic tab IDs internally so they don't collide with the user's real
 instances.
+
+[caffeinate-man]: https://ss64.com/mac/caffeinate.html
