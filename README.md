@@ -1,5 +1,7 @@
 # claffeinate
 
+[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fnhooey%2Fclaffeinate)](https://garnix.io/repo/nhooey/claffeinate)
+
 A small Bash wrapper around `caffeinate(1)` that tags each instance with the
 Claude Code tab that owns it. Multi-tab workflows can detect and reap orphans
 (instances whose Claude tab has died) without killing each other's instances.
@@ -9,13 +11,26 @@ macOS only. Bash 3.2+. Zero external dependencies beyond macOS built-ins;
 
 ## Install
 
-Symlink `bin/claffeinate` into a directory on your `PATH`:
+### From a local checkout
+
+Symlink the script into a directory on your `PATH`, dropping the `.sh`
+extension so the command is just `claffeinate`:
 
 ```sh
-ln -s "$PWD/bin/claffeinate" ~/bin/claffeinate
+ln -s "$PWD/bin/claffeinate.sh" ~/bin/claffeinate
 ```
 
-Then verify:
+### Via the Nix flake
+
+```sh
+nix run github:nhooey/claffeinate -- --help     # one-off
+nix profile install github:nhooey/claffeinate   # persistent
+```
+
+The flake wraps the script with `jq` on `PATH`, so `--json` works without a
+separate install.
+
+### Verify
 
 ```sh
 claffeinate --help

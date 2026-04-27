@@ -1,0 +1,13 @@
+# Garnix CI configuration. See https://garnix.io/docs/ci/yaml_config/
+#
+# claffeinate is Darwin-only (wraps macOS caffeinate(1) and uses BSD ps -E).
+# The default include set is Linux-focused, so list Darwin attrs explicitly.
+builds:
+  include:
+    - "packages.aarch64-darwin.*"
+    - "packages.x86_64-darwin.*"
+    - "checks.aarch64-darwin.*"
+    - "checks.x86_64-darwin.*"
+    - "devShells.aarch64-darwin.default"
+    - "devShells.x86_64-darwin.default"
+  exclude: []
