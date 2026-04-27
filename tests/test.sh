@@ -39,6 +39,16 @@ FAILS=0
 PASSES=0
 SKIPS=0
 
+# Garnix's macOS build sandbox blocks exec of any path outside /nix/store
+# (caffeinate(1), /bin/sleep, etc.) with EPERM. Probe once: if a tiny
+# system-binary exec fails, mark the suite so caffeinate-dependent tests
+# skip rather than fail. Locally and in unrestricted environments this is
+# a no-op.
+SYSTEM_EXEC_BLOCKED=0
+if ! /bin/sleep 0 2>/dev/null; then
+  SYSTEM_EXEC_BLOCKED=1
+fi
+
 pass() {
   printf 'PASS %s\n' "$1"
   PASSES=$((PASSES + 1))
@@ -94,6 +104,10 @@ trap cleanup EXIT
 # Test 1: start is idempotent
 # ---------------------------------------------------------------------------
 test_start_idempotent() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip start_idempotent "macOS system-binary exec blocked (Garnix sandbox); needs caffeinate(1)"
+    return
+  fi
   local out1 out2 tagged_count
   out1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
     "${CLAFF[@]}" start 2>&1) || {
@@ -122,6 +136,10 @@ test_start_idempotent() {
 # Test 2: list shows the instance
 # ---------------------------------------------------------------------------
 test_list_shows_instance() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip list_shows_instance "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    return
+  fi
   local out
   out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
     "${CLAFF[@]}" list 2>&1)
@@ -139,6 +157,10 @@ test_list_shows_instance() {
 # Test 3: kill-mine removes it
 # ---------------------------------------------------------------------------
 test_kill_mine() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip kill_mine "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    return
+  fi
   local out tag
   TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
     "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || {
@@ -204,6 +226,10 @@ test_kill_orphans_alive_noop() {
 # Test 5: kill-orphans reaps fakes
 # ---------------------------------------------------------------------------
 test_kill_orphans_reaps_fakes() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip kill_orphans_reaps_fakes "fake orphan needs /bin/sleep exec (Garnix sandbox blocks it)"
+    return
+  fi
   local fake_sid="bogus-test-$$"
   local fake_port="9999"
   local fake_dir="orphandir"
@@ -331,6 +357,10 @@ EOF
 # Test 9: short options still work
 # ---------------------------------------------------------------------------
 test_short_options() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip short_options "needs caffeinate(1) exec (Garnix sandbox blocks it)"
+    return
+  fi
   # Use a unique sid+port so we don't collide with test 1's instance.
   local short_sid="${TEST_TERM_SID}-short"
   local short_port
