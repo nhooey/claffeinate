@@ -1,3 +1,7 @@
 /result
 /result-*
 /.direnv/
+
+# Project-scope skill installs from the dev shell's reconcile startup hook.
+# Symlinks into the Nix store, not source.
+/.claude/skills/

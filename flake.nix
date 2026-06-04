@@ -14,10 +14,68 @@
 
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    # `flake-skills` is the builder library, not a skill — it provides
+    # `mkCombination`, used in `outputs` to build the dev-shell skill set.
+    flake-skills.url = "github:nhooey/flake-skills";
+    flake-skills.inputs.nixpkgs.follows = "nixpkgs";
+
+    # ---------------------------------------------------------------------
+    # Dev-shell skill sources (inlined — consumed only by the dev shell)
+    # ---------------------------------------------------------------------
+    # The project dev shell installs one curated skill set: the full git/GitHub
+    # hygiene pack plus the nix-flakes and nix-garnix-ci skills from skills-nix
+    # — combined via flake-skills' `mkCombination` in `outputs` (`devshellSkills`).
+    # These were previously isolated in a `skills-devshell/` sub-flake, but a
+    # same-repo sub-flake can only be addressed by a relative `path:` input
+    # (which sandboxed/transitive consumers reject) or a brittle self-URL (which
+    # breaks on any repo/owner/host rename), so they are inlined here instead.
+    #
+    # Each source `follows` only the parent `nixpkgs`, NOT `flake-skills`.
+    # Forcing `flake-skills.follows` would make the combination's transitive
+    # sources resolve against this root's owner-namespacing flake-skills and
+    # trip a strict null-owner check. Following only nixpkgs and letting each
+    # source keep its own flake-skills is the proven working pattern.
+    skills-git = {
+      url = "github:nhooey/skills-git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    skills-nix = {
+      url = "github:nhooey/skills-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { flake-parts, ... }@inputs:
+    {
+      flake-parts,
+      nixpkgs,
+      flake-skills,
+      ...
+    }@inputs:
+    let
+      # The project dev-shell skill set, combined from the inlined skill
+      # sources: the full git/GitHub hygiene pack plus the nix-flakes and
+      # nix-garnix-ci skills from skills-nix. `reconcileScript` is a
+      # `system -> string` function the dev shell splices into a startup hook.
+      devshellSkills = flake-skills.lib.mkCombination {
+        inherit nixpkgs;
+        name = "claffeinate-devshell";
+        envName = "agent-skills-claffeinate-devshell";
+        packagePrefix = "agent-skill-";
+        sources = [
+          { source = inputs.skills-git; }
+          {
+            source = inputs.skills-nix;
+            skills = [
+              "nix-flakes"
+              "nix-garnix-ci"
+            ];
+          }
+        ];
+      };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       # Darwin-only: claffeinate wraps macOS caffeinate(1) and uses BSD ps -E.
       # Hardcoded rather than via nix-systems/default because Linux builds
@@ -33,7 +91,12 @@
       ];
 
       perSystem =
-        { pkgs, lib, ... }:
+        {
+          pkgs,
+          lib,
+          system,
+          ...
+        }:
         {
           packages.default = pkgs.stdenv.mkDerivation {
             pname = "claffeinate";
@@ -113,6 +176,13 @@
             motd = ''
               {bold}{14}claffeinate dev shell{reset}
               Type {bold}menu{reset} to see available commands.
+            '';
+            # Reconcile the dev-shell skill set (git/GitHub hygiene pack plus
+            # the nix-flakes / nix-garnix-ci skills) at project scope under a
+            # single owner. `devshellSkills` (in `outputs`) yields the reconcile
+            # one-liner per system; this splices it in.
+            devshell.startup.install-skills.text = ''
+              ${devshellSkills.reconcileScript system}
             '';
             packages = [
               pkgs.bash
