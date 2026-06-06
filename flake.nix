@@ -9,18 +9,16 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
 
-    devshell.url = "github:numtide/devshell";
-    devshell.inputs.nixpkgs.follows = "nixpkgs";
-
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
 
     # `agent-skill-flake` is the builder library, not a skill — it provides the
-    # `devshellSkillsHook` that wires the dev-shell skill set in below. The skill
-    # sources themselves are NOT inputs here: they live only in the
-    # `skills-devshell/` sub-flake's lock, which this dev shell invokes at
-    # RUNTIME (never as a root input), keeping this flake a leaf with zero skill
-    # inputs.
+    # `flakeModules.devshellSkills` flake-parts module that wires the dev-shell
+    # skill set in below. That module bundles numtide/devshell, so this flake
+    # needs no `devshell` input of its own. The skill sources themselves are NOT
+    # inputs here: they live only in the `skills-devshell/` sub-flake's lock,
+    # which this dev shell invokes at RUNTIME (never as a root input), keeping
+    # this flake a leaf with zero skill inputs.
     agent-skill-flake.url = "github:nhooey/agent-skill-flake";
     agent-skill-flake.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -28,17 +26,8 @@
   outputs =
     {
       flake-parts,
-      agent-skill-flake,
       ...
     }@inputs:
-    let
-      # Root-side wiring for the `skills-devshell/` sub-flake: the dev-shell
-      # skill set (all skills-git skills plus nix-flakes/nix-garnix-ci from
-      # skills-nix) is defined in the isolated `skills-devshell/` sub-flake and
-      # invoked here at RUNTIME (not a root input), so this flake keeps zero
-      # skill inputs and never drags the skill mesh into its lock.
-      devshellSkills = agent-skill-flake.lib.devshellSkillsHook { };
-    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       # Darwin-only: claffeinate wraps macOS caffeinate(1) and uses BSD ps -E.
       # Hardcoded rather than via nix-systems/default because Linux builds
@@ -49,9 +38,23 @@
       ];
 
       imports = [
-        inputs.devshell.flakeModule
+        # Bundles numtide/devshell + the whole dev-shell skills convention
+        # (motd, install-skills startup, the ci/dev/maintenance command trio,
+        # and the reap-skills/update-skills-devshell pair). Configured via the
+        # `agent-skill-flake.devshellSkills` options block below.
+        inputs.agent-skill-flake.flakeModules.devshellSkills
         inputs.treefmt-nix.flakeModule
       ];
+
+      # claffeinate keeps its custom motd ("Type menu …"); the module's
+      # generated banner is overridden by passing `motd` here.
+      agent-skill-flake.devshellSkills = {
+        name = "claffeinate";
+        motd = ''
+          {bold}{14}claffeinate dev shell{reset}
+          Type {bold}menu{reset} to see available commands.
+        '';
+      };
 
       perSystem =
         { pkgs, lib, ... }:
@@ -129,12 +132,13 @@
                 '';
           };
 
+          # The devshellSkills module (imported above) supplies this devShell's
+          # name, motd, the install-skills startup, the ci/dev/maintenance
+          # command trio (check / fmt / update-flake), and the skills commands
+          # (reap-skills / update-skills-devshell). Only claffeinate-specific
+          # packages and commands are set here; both are list options, so they
+          # merge onto the module's rather than replacing them.
           devshells.default = {
-            name = "claffeinate";
-            motd = ''
-              {bold}{14}claffeinate dev shell{reset}
-              Type {bold}menu{reset} to see available commands.
-            '';
             packages = [
               pkgs.bash
               pkgs.jq
@@ -142,27 +146,7 @@
               pkgs.shfmt
             ];
 
-            # Auto-reconcile the dev-shell skill set at project scope on
-            # `nix develop`: every skills-git skill plus nix-flakes/
-            # nix-garnix-ci from skills-nix, merged into one combination that a
-            # single reconcile owner converges. The skills-devshell sub-flake's
-            # reconcile app is invoked at RUNTIME by this hook, so the skill
-            # sources never become root inputs.
-            devshell.startup.install-skills.text = devshellSkills.startup;
-
             commands = [
-              {
-                category = "ci";
-                name = "check";
-                help = "Run all flake checks (formatter + shellcheck)";
-                command = ''nix flake check "$@"'';
-              }
-              {
-                category = "dev";
-                name = "fmt";
-                help = "Format Nix and shell sources via treefmt";
-                command = ''nix fmt "$@"'';
-              }
               {
                 category = "dev";
                 name = "lint";
@@ -178,8 +162,7 @@
                 help = "Run the acceptance test suite";
                 command = ''exec "$PRJ_ROOT/tests/test.sh" "$@"'';
               }
-            ]
-            ++ devshellSkills.commands;
+            ];
           };
         };
     };

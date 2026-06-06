@@ -49,8 +49,6 @@
       inherit nixpkgs;
       systems = import inputs.systems;
       name = "claffeinate-skills";
-      envName = "agent-skills-claffeinate-skills";
-      packagePrefix = "agent-skill-";
       sources = [
         { source = skills-git; }
         {
