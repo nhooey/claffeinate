@@ -58,7 +58,7 @@ Symlinks live under `/tmp/claffeinate/symlinks/`; pidfiles live under
 Long options are canonical; short options are accepted but not used in
 documentation.
 
-### `claffeinate start [--display|--idle|--disk|--system|--user|--timeout SECS]...`
+### `claffeinate start [--display|--idle|--disk|--system|--user|--timeout DURATION]...`
 
 Start a tagged caffeinate instance for the current tab. Defaults to
 `--display` if no flag is given. Idempotent: a second `start` in the same
@@ -67,7 +67,8 @@ tab detects the existing instance and exits 0 without spawning a duplicate.
 ```sh
 claffeinate start                       # --display by default
 claffeinate start --idle --display      # combine assertions
-claffeinate start --timeout 3600        # auto-expire after 1 hour
+claffeinate start --timeout 1h          # auto-expire after 1 hour
+claffeinate start --timeout 1h30m       # units d, h, m, s; bare number is seconds
 ```
 
 ### `claffeinate list [--json]`
@@ -102,8 +103,9 @@ Kill the instance owned by this tab; remove its pidfile and symlink. Exits
 
 Kill every tagged instance whose Claude tab is no longer alive. The matching
 rule is "no `claude` process advertises both this `TERM_SESSION_ID` and this
-`CLAUDE_CODE_SSE_PORT` in its environment." `--dry-run` only prints what
-would be killed.
+`CLAUDE_CODE_SSE_PORT` in its environment." It also kills heartbeat loops
+that have lost their caffeinate. `--dry-run` only prints what would be
+killed.
 
 ### `claffeinate claude-pid --term-session-id ID --sse-port PORT`
 

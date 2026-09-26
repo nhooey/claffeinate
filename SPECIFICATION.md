@@ -56,7 +56,7 @@ Long options are canonical and used throughout this spec, the README, the
 but never appear in documentation.
 
 ```
-claffeinate start [--display|--idle|--disk|--system|--user|--timeout SECS]...   # default: --display
+claffeinate start [--display|--idle|--disk|--system|--user|--timeout DURATION]...   # default: --display
 claffeinate list   [--json]
 claffeinate status [--json]
 claffeinate kill-mine
@@ -75,7 +75,7 @@ Short option aliases (accepted; not used in docs):
 | `--disk`                 | `-m`   | `start`         | translates to `caffeinate -m`      |
 | `--system`               | `-s`   | `start`         | translates to `caffeinate -s`      |
 | `--user`                 | `-u`   | `start`         | translates to `caffeinate -u`      |
-| `--timeout SECS`         | `-t`   | `start`         | translates to `caffeinate -t SECS` |
+| `--timeout DURATION`     | `-t`   | `start`         | heartbeat exits after DURATION     |
 | `--json`                 | `-j`   | `list`/`status` | JSON output via `jq` (required)    |
 | `--dry-run`              | `-n`   | `kill-orphans`  | only print what would be killed    |
 | `--term-session-id ID`   | (none) | `claude-pid`    | required                           |
@@ -156,8 +156,11 @@ main (args...) -> case "$1" in start) cmd_start "${@:2}";; ... esac
 ### `cmd_start`
 
 1. Parse the long-and-short caffeinate flags (`--display|-d`, `--idle|-i`,
-   `--disk|-m`, `--system|-s`, `--user|-u`, `--timeout SECS|-t SECS`); accept
-   any combination. Default to `--display` if none given.
+   `--disk|-m`, `--system|-s`, `--user|-u`, `--timeout DURATION|-t DURATION`); accept
+   any combination. Default to `--display` if none given. DURATION is a bare
+   number of seconds or `<number><unit>` parts in d/h/m/s order (`30s`,
+   `60m`, `1h30m`, `2d`), converted to seconds by `duration_to_seconds`;
+   anything else, or a zero total, exits 2.
 2. Compute `tag=$(current_tag)`.
 3. If `[ -f "${RUN_DIR}${tag}.pid" ]` and
    `kill -0 "$(cat ${RUN_DIR}${tag}.pid)" 2>/dev/null`,
@@ -166,7 +169,15 @@ main (args...) -> case "$1" in start) cmd_start "${@:2}";; ... esac
    `${TAG_DIR}${tag} -> $(command -v caffeinate)`.
 5. Translate the parsed long flags back to caffeinate's short forms and exec
    the symlink in background with those flags plus a heartbeat:
-   `sh -c 'while true; do printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$PWD"; sleep 60; done'`.
+   `sh -c '<heartbeat>' sh "$TAG_DIR" "$timeout"`, where the heartbeat prints
+   `[%s] awake (full-dir=%s)` every 60 sec. caffeinate(1) forks: the original
+   process execs the heartbeat and the tagged caffeinate stays behind as its
+   child, exiting when the heartbeat does. So the heartbeat:
+   - ends itself once `$timeout` seconds have passed, because caffeinate
+     ignores `-t` when given a utility, and `-t` is not passed;
+   - ends itself once it has no child whose argv contains `$TAG_DIR`
+     (`pgrep -q -P $$ -f`), since killing only the caffeinate would otherwise
+     leave it running under launchd until reboot.
 6. Write PID to `${RUN_DIR}${tag}.pid`. Echo the PID.
 
 ### `cmd_list`
@@ -208,7 +219,15 @@ For each tagged PID:
 - Parse tag → `(term_sid, sse_port, dir)`.
 - If `tab_is_alive` returns non-zero:
     - With `--dry-run`: echo `would kill <pid> <tag>`.
-    - Otherwise: `kill <pid>`; remove pidfile + symlink; echo `killed <pid> <tag>`.
+    - Otherwise: `kill <pid>` and the heartbeat PID in the pidfile; remove
+      pidfile + symlink; echo `killed <pid> <tag>`.
+
+Then, for each heartbeat (`pgrep -f '^sh -c .*awake \(full-dir='`) with no
+tagged caffeinate child (`pgrep -P <pid> -f "$TAG_PREFIX"`), which no tab can
+own:
+
+- With `--dry-run`: echo `would kill <pid> heartbeat`.
+- Otherwise: `kill <pid>`; echo `killed <pid> heartbeat`.
 
 ### `claude_pid_for`
 
@@ -277,6 +296,13 @@ Ship as `tests/test.sh` invoking the script as a subprocess. Each test prints
    JSON on stdout.
 9. **short options still work**: `claffeinate start -d` and
    `claffeinate list -j` behave identically to their long-form equivalents.
+10. **kill-orphans reaps heartbeat loops**: start an `sh -c` heartbeat loop
+    with no caffeinate child; `claffeinate kill-orphans` should kill it.
+11. **--timeout expires**: `claffeinate start --timeout 2s` is not flagged by
+    `kill-orphans --dry-run` while running, and both the heartbeat and the
+    tagged caffeinate are gone 3.5 sec later.
+12. **--timeout rejects bad durations**: `start --timeout` with `1x`, `30ms`,
+    `m`, `1m1h`, or `0s` exits 2 without starting anything.
 
 ## Out of scope
 
