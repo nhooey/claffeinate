@@ -394,6 +394,95 @@ test_short_options() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 10: kill-orphans reaps heartbeat loops left under launchd
+# ---------------------------------------------------------------------------
+test_kill_orphans_reaps_heartbeats() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip kill_orphans_reaps_heartbeats "fake heartbeat needs /bin/sleep exec (build sandbox blocks it)"
+    return
+  fi
+  local marker="bogus-test-heartbeat-$$"
+  # A heartbeat in the old `while true` form with no caffeinate child, as
+  # left behind when only the tagged caffeinate was killed.
+  # shellcheck disable=SC2016 # body runs under sh -c
+  (sh -c 'while true; do printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$1"; sleep 60; done' \
+    sh "$marker" >/dev/null 2>&1 &)
+  sleep 0.3
+
+  local pid
+  pid=$(pgrep -f -- "awake \\(full-dir=.*sh ${marker}\$" 2>/dev/null | head -n 1)
+  if [ -z "$pid" ]; then
+    fail kill_orphans_reaps_heartbeats "could not start fake heartbeat"
+    return
+  fi
+
+  local out
+  out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" kill-orphans 2>&1) || true
+  sleep 0.3
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    fail kill_orphans_reaps_heartbeats "fake heartbeat $pid still alive: $out"
+    return
+  fi
+  pass kill_orphans_reaps_heartbeats
+}
+
+# ---------------------------------------------------------------------------
+# Test 11: --timeout expires, taking heartbeat and caffeinate with it
+# ---------------------------------------------------------------------------
+test_start_timeout_expires() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip start_timeout_expires "needs caffeinate(1) exec (build sandbox blocks it)"
+    return
+  fi
+  local sid="${TEST_TERM_SID}-timeout"
+  local pid out
+  pid=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" start --idle --timeout 2s 2>&1) || {
+    fail start_timeout_expires "start failed: $pid"
+    return
+  }
+  sleep 0.5
+  out=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" kill-orphans --dry-run 2>&1) || true
+  if [[ $out == *"would kill ${pid} heartbeat"* ]]; then
+    fail start_timeout_expires "live heartbeat flagged as orphaned: $out"
+    return
+  fi
+  sleep 3
+  if kill -0 "$pid" 2>/dev/null ||
+    pgrep -af -- "caffeinate--claffeinate--tab-${sid}-" >/dev/null 2>&1; then
+    TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
+    fail start_timeout_expires "instance still running 3.5s after a 2s timeout"
+    return
+  fi
+  pass start_timeout_expires
+}
+
+# ---------------------------------------------------------------------------
+# Test 12: --timeout rejects bad durations
+# ---------------------------------------------------------------------------
+test_start_timeout_rejects_bad_durations() {
+  local sid="${TEST_TERM_SID}-badtimeout"
+  local bad out rc
+  for bad in 1x 30ms m 1m1h 0s ""; do
+    out=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" start --timeout "$bad" 2>&1)
+    rc=$?
+    if [ "$rc" != "2" ]; then
+      TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+        "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
+      fail start_timeout_rejects_bad_durations "'$bad': expected exit 2, got $rc: $out"
+      return
+    fi
+  done
+  pass start_timeout_rejects_bad_durations
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 test_start_idempotent
@@ -405,6 +494,9 @@ test_claude_pid_resolves
 test_json_parses
 test_json_without_jq_fails
 test_short_options
+test_kill_orphans_reaps_heartbeats
+test_start_timeout_expires
+test_start_timeout_rejects_bad_durations
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASSES" "$FAILS" "$SKIPS"
 [ "$FAILS" -eq 0 ]

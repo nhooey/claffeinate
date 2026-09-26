@@ -27,6 +27,10 @@ readonly TAG_PREFIX="caffeinate--claffeinate--"
 readonly RUN_DIR="${CLAFFEINATE_RUN_DIR:-/tmp/claffeinate/}"
 readonly TAG_DIR="${RUN_DIR}symlinks/"
 readonly CLAUDE_BIN_NAME="claude"
+# Matches the heartbeat `sh -c` that caffeinate(1) runs as its utility.
+# Anchored on `^sh -c` so the tagged caffeinate, whose argv also carries
+# the heartbeat text, never matches.
+readonly HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
 
 # ---------- pure detection ----------
 
@@ -63,6 +67,16 @@ parse_tag() {
 
 list_tagged_pids() {
   pgrep -a -f -- "$TAG_PREFIX" 2>/dev/null || true
+}
+
+list_orphaned_heartbeat_pids() {
+  # caffeinate(1) forks: the original process execs the utility and the
+  # tagged caffeinate stays behind as its child. A heartbeat with no
+  # tagged child has lost its caffeinate and keeps nothing awake.
+  local pid
+  for pid in $(pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null); do
+    pgrep -q -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || printf '%s\n' "$pid"
+  done
 }
 
 tag_for_pid() {
@@ -146,12 +160,32 @@ etime_to_seconds() {
   printf '%d\n' "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
 }
 
+duration_to_seconds() {
+  # Accepts a bare number of seconds or one or more <number><unit> parts in
+  # descending order, units d/h/m/s: 90, 30s, 60m, 1h30m, 2d. Fails on
+  # anything else, and on a zero total.
+  local duration="$1"
+  local re='^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$'
+  local total
+  if [[ $duration =~ ^[0-9]+$ ]]; then
+    total=$((10#$duration))
+  elif [ -n "$duration" ] && [[ $duration =~ $re ]]; then
+    local d="${BASH_REMATCH[1]%d}" h="${BASH_REMATCH[2]%h}"
+    local m="${BASH_REMATCH[3]%m}" s="${BASH_REMATCH[4]%s}"
+    total=$((10#${d:-0} * 86400 + 10#${h:-0} * 3600 + 10#${m:-0} * 60 + 10#${s:-0}))
+  else
+    return 1
+  fi
+  [ "$total" -gt 0 ] || return 1
+  printf '%d\n' "$total"
+}
+
 usage() {
   cat <<'EOF'
 claffeinate -- tag caffeinate instances with the Claude Code tab that owns them
 
 Usage:
-  claffeinate start [--display|--idle|--disk|--system|--user|--timeout SECS]...
+  claffeinate start [--display|--idle|--disk|--system|--user|--timeout DURATION]...
   claffeinate list   [--json]
   claffeinate status [--json]
   claffeinate kill-mine
@@ -166,7 +200,7 @@ Flags for `start` (no flag: defaults to --display):
   --disk       prevent disk sleep            (caffeinate -m)
   --system     prevent system sleep on AC    (caffeinate -s)
   --user       declare user is active        (caffeinate -u)
-  --timeout N  expire after N seconds        (caffeinate -t N)
+  --timeout D  expire after D: 30s, 60m, 1h30m, 2d (bare number: seconds)
 
 Exit codes:
   0  success
@@ -233,7 +267,10 @@ cmd_start() {
         printf "error: --timeout requires a value\n" >&2
         return 2
       fi
-      timeout="$2"
+      if ! timeout=$(duration_to_seconds "$2"); then
+        printf "error: --timeout expects a duration like 30s, 60m, 1h30m: %s\n" "$2" >&2
+        return 2
+      fi
       shift 2
       ;;
     --help | -h)
@@ -280,16 +317,16 @@ cmd_start() {
   ln -sf "$caffeinate_bin" "$symlink"
 
   local logfile="${RUN_DIR}${tag}.log"
+  # The heartbeat is caffeinate(1)'s utility, and caffeinate ignores -t when
+  # given one, so the loop enforces the timeout ($2) itself; caffeinate
+  # exits when its utility does. The loop also exits once its tagged
+  # caffeinate child (argv[0] under $1, the symlink dir) is gone, since
+  # nothing else would ever stop it.
   # shellcheck disable=SC2016 # body is run under sh -c later, so $-vars must stay literal here
-  local heartbeat='while true; do printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$PWD"; sleep 60; done'
+  local heartbeat='deadline=${2:+$(($(date +%s) + $2))}; while pgrep -q -P $$ -f -- "$1"; do nap=60; if [ -n "$deadline" ]; then left=$((deadline - $(date +%s))); [ "$left" -gt 0 ] || exit 0; [ "$left" -lt "$nap" ] && nap=$left; fi; printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$PWD"; sleep "$nap"; done'
 
-  if [ -n "$timeout" ]; then
-    (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" -t "$timeout" sh -c "$heartbeat") \
-      >"$logfile" 2>&1 &
-  else
-    (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" sh -c "$heartbeat") \
-      >"$logfile" 2>&1 &
-  fi
+  (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" sh -c "$heartbeat" sh "$TAG_DIR" "$timeout") \
+    >"$logfile" 2>&1 &
   local pid=$!
   printf '%s\n' "$pid" >"$pidfile"
   printf '%s\n' "$pid"
@@ -442,7 +479,7 @@ cmd_kill_orphans() {
     esac
   done
 
-  local pids pid tag parsed term_sid sse_port dir
+  local pids pid tag parsed term_sid sse_port dir pidfile_pid
   pids=$(list_tagged_pids)
   for pid in $pids; do
     tag=$(tag_for_pid "$pid")
@@ -459,9 +496,24 @@ cmd_kill_orphans() {
     if [ "$dry_run" = "1" ]; then
       printf "would kill %s %s\n" "$pid" "$tag"
     else
-      kill "$pid" 2>/dev/null || true
+      # The pidfile holds the heartbeat, caffeinate's parent; killing it
+      # takes the caffeinate down too, where killing only the caffeinate
+      # would leave the heartbeat running.
+      pidfile_pid=$(cat "${RUN_DIR}${tag}.pid" 2>/dev/null || true)
+      kill "$pid" ${pidfile_pid:+"$pidfile_pid"} 2>/dev/null || true
       rm -f "${RUN_DIR}${tag}.pid" "${TAG_DIR}${tag}"
       printf "killed %s %s\n" "$pid" "$tag"
+    fi
+  done
+
+  # Heartbeats that outlived their caffeinate carry no tag, so the tab
+  # check above cannot see them.
+  for pid in $(list_orphaned_heartbeat_pids); do
+    if [ "$dry_run" = "1" ]; then
+      printf "would kill %s heartbeat\n" "$pid"
+    else
+      kill "$pid" 2>/dev/null || true
+      printf "killed %s heartbeat\n" "$pid"
     fi
   done
 }
