@@ -15,8 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # CLAFF is an array so we can invoke claffeinate.sh through `bash` rather
 # than relying on the kernel to exec the script directly. Some sandboxes
-# (Garnix Darwin) block exec on the build volume even though writes are
-# fine; bash-as-loader bypasses that.
+# (sandboxed macOS Nix builds) block exec on the build volume even though
+# writes are fine; bash-as-loader bypasses that.
 if [ -n "${CLAFFEINATE_BIN:-}" ]; then
   CLAFF=("$CLAFFEINATE_BIN")
 else
@@ -39,7 +39,7 @@ FAILS=0
 PASSES=0
 SKIPS=0
 
-# Garnix's macOS build sandbox blocks exec of any path outside /nix/store
+# A sandboxed macOS Nix build can block exec of any path outside /nix/store
 # (caffeinate(1), /bin/sleep, etc.) with EPERM. Probe once: if a tiny
 # system-binary exec fails, mark the suite so caffeinate-dependent tests
 # skip rather than fail. Locally and in unrestricted environments this is
@@ -105,7 +105,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 test_start_idempotent() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip start_idempotent "macOS system-binary exec blocked (Garnix sandbox); needs caffeinate(1)"
+    skip start_idempotent "macOS system-binary exec blocked (build sandbox); needs caffeinate(1)"
     return
   fi
   local out1 out2 tagged_count
@@ -227,7 +227,7 @@ test_kill_orphans_alive_noop() {
 # ---------------------------------------------------------------------------
 test_kill_orphans_reaps_fakes() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip kill_orphans_reaps_fakes "fake orphan needs /bin/sleep exec (Garnix sandbox blocks it)"
+    skip kill_orphans_reaps_fakes "fake orphan needs /bin/sleep exec (build sandbox blocks it)"
     return
   fi
   local fake_sid="bogus-test-$$"
@@ -236,7 +236,7 @@ test_kill_orphans_reaps_fakes() {
   local tag="caffeinate--claffeinate--tab-${fake_sid}-${fake_port}--dir-${fake_dir}"
   mkdir -p "$RUN_DIR" "$TAG_DIR"
   # Symlink is the kill-orphans cleanup target. We don't exec it -- some
-  # sandboxes (Garnix Darwin runners) block exec on the build volume.
+  # sandboxes (sandboxed macOS Nix builds) block exec on the build volume.
   # Use `exec -a` to set argv[0] to the symlink path, which is what
   # tag_for_pid / pgrep -f match against.
   ln -sf /bin/sleep "${TAG_DIR}${tag}"
@@ -358,7 +358,7 @@ EOF
 # ---------------------------------------------------------------------------
 test_short_options() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip short_options "needs caffeinate(1) exec (Garnix sandbox blocks it)"
+    skip short_options "needs caffeinate(1) exec (build sandbox blocks it)"
     return
   fi
   # Use a unique sid+port so we don't collide with test 1's instance.
