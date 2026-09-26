@@ -1,5 +1,5 @@
 {
-  description = "claffeinate dev-shell skill set — an isolated sub-flake invoked at RUNTIME by the root devShell, never a root input. The skill sources (all skills-git skills plus nix-flakes/nix-garnix-ci from skills-nix) live only in THIS flake's lock, so the root claffeinate stays a leaf with zero skill inputs and transitive consumers never drag the skill mesh in.";
+  description = "claffeinate dev-shell skill set — an isolated sub-flake invoked at RUNTIME by the root devShell, never a root input. The skill sources (all skills-git skills plus nix-flakes from skills-nix) live only in THIS flake's lock, so the root claffeinate stays a leaf with zero skill inputs and transitive consumers never drag the skill mesh in.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -24,7 +24,7 @@
       };
     };
 
-    # skills-nix: only nix-flakes and nix-garnix-ci are cherry-picked below.
+    # skills-nix: only nix-flakes is cherry-picked below.
     # skills-nix still names its builder input `flake-skills` (agent-skill-flake
     # is that repo renamed), followed onto our node to collapse the builder.
     skills-nix = {
@@ -53,10 +53,7 @@
         { source = skills-git; }
         {
           source = skills-nix;
-          skills = [
-            "nix-flakes"
-            "nix-garnix-ci"
-          ];
+          skills = [ "nix-flakes" ];
         }
       ];
     };

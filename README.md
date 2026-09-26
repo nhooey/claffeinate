@@ -1,7 +1,5 @@
 # claffeinate
 
-[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fnhooey%2Fclaffeinate)](https://garnix.io/repo/nhooey/claffeinate)
-
 A small Bash wrapper around [`caffeinate(1)`][caffeinate-man] (the macOS
 utility that keeps your Mac awake) that tags each instance with the Claude
 Code tab that owns it. Multi-tab workflows can detect and reap orphans (instances whose Claude

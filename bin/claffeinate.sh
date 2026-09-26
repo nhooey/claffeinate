@@ -273,7 +273,7 @@ cmd_start() {
   fi
   # The symlink stays as a kill-mine fallback marker (its presence /
   # removal is part of the contract), but we never exec it -- some
-  # sandboxes (notably Garnix's macOS build runner) block exec on the
+  # sandboxes (notably sandboxed macOS Nix builds) block exec on the
   # build volume even though writes are fine. Instead, exec the real
   # caffeinate(1) and override argv[0] with the symlink path via
   # `exec -a`, which gives the same observable tag in `ps`/`pgrep`.
