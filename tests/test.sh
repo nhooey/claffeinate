@@ -483,6 +483,46 @@ test_start_timeout_rejects_bad_durations() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 13: every command has its own --help
+# ---------------------------------------------------------------------------
+test_per_command_help() {
+  local sid="${TEST_TERM_SID}-help"
+  local cmd out via_help rc
+  for cmd in start list status kill-mine kill-orphans claude-pid; do
+    out=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" "$cmd" --help 2>&1)
+    rc=$?
+    if [ "$rc" != "0" ] || [[ $out != "Usage: claffeinate $cmd"* ]]; then
+      fail per_command_help "'$cmd --help': exit $rc, output: $out"
+      return
+    fi
+    via_help=$("${CLAFF[@]}" help "$cmd" 2>&1)
+    if [ "$via_help" != "$out" ]; then
+      fail per_command_help "'help $cmd' differs from '$cmd --help'"
+      return
+    fi
+    out=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" "$cmd" --no-such-flag 2>&1)
+    rc=$?
+    if [ "$rc" != "2" ] || [[ $out != *"claffeinate $cmd --help"* ]]; then
+      fail per_command_help "'$cmd --no-such-flag': exit $rc, output: $out"
+      return
+    fi
+  done
+  if ls "${RUN_DIR}"*"${sid}"*.pid >/dev/null 2>&1; then
+    fail per_command_help "'start --help' started an instance"
+    return
+  fi
+  "${CLAFF[@]}" help no-such-command >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" != "2" ]; then
+    fail per_command_help "'help no-such-command': expected exit 2, got $rc"
+    return
+  fi
+  pass per_command_help
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 test_start_idempotent
@@ -497,6 +537,7 @@ test_short_options
 test_kill_orphans_reaps_heartbeats
 test_start_timeout_expires
 test_start_timeout_rejects_bad_durations
+test_per_command_help
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASSES" "$FAILS" "$SKIPS"
 [ "$FAILS" -eq 0 ]

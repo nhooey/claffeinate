@@ -62,9 +62,18 @@ claffeinate status [--json]
 claffeinate kill-mine
 claffeinate kill-orphans [--dry-run]
 claffeinate claude-pid --term-session-id ID --sse-port PORT
-claffeinate help
+claffeinate help [COMMAND]
 claffeinate [--help]
+claffeinate COMMAND --help
 ```
+
+Help is per command. `claffeinate --help` (or `help`, or no arguments) prints
+an overview: a one-line summary of each command and the exit codes.
+`claffeinate COMMAND --help` and `claffeinate help COMMAND` print the same
+text for that command: its synopsis, what it does, its options and, where
+useful, examples. Help goes to stdout and exits 0; `start --help` starts
+nothing. An unknown flag exits 2 with
+`error: unknown flag for COMMAND: FLAG (see 'claffeinate COMMAND --help')`.
 
 Short option aliases (accepted; not used in docs):
 
@@ -80,7 +89,7 @@ Short option aliases (accepted; not used in docs):
 | `--dry-run`              | `-n`   | `kill-orphans`  | only print what would be killed    |
 | `--term-session-id ID`   | (none) | `claude-pid`    | required                           |
 | `--sse-port PORT`        | (none) | `claude-pid`    | required                           |
-| `--help`                 | `-h`   | (any)           | print help and exit 0              |
+| `--help`                 | `-h`   | (any)           | print that command's help, exit 0  |
 
 `caffeinate(1)` itself does not understand long options; the script translates
 long → short before exec'ing the symlink. Default to `--display` if no flag
@@ -90,7 +99,7 @@ Exit codes:
 
 - `0` success
 - `1` generic error
-- `2` misuse (unknown subcommand, unknown flag, missing required arg)
+- `2` misuse (unknown command, unknown flag, missing required arg)
 - `3` nothing matched (e.g., `kill-mine` with no instance for this tab)
 - `4` `--json` requested but `jq` is not installed
 
@@ -143,6 +152,15 @@ cmd_status        (--json?)                      -> like list but also includes 
 cmd_kill_mine     ()                             -> kills the instance owned by THIS tab
 cmd_kill_orphans  (--dry-run?)                   -> kills all instances whose Claude tab is dead
 cmd_claude_pid    (--term-session-id, --sse-port) -> echoes claude PID; exit 1 if none
+```
+
+### Help
+
+```
+usage             ()                             -> overview: commands and exit codes
+usage_<command>   ()                             -> one per command, e.g. usage_kill_orphans
+cmd_help          (command?)                     -> usage or usage_<command>; exit 2 if unknown
+unknown_flag      (command, flag)                -> prints the error pointing at COMMAND --help
 ```
 
 ### Dispatch
@@ -303,6 +321,11 @@ Ship as `tests/test.sh` invoking the script as a subprocess. Each test prints
     tagged caffeinate are gone 3.5 sec later.
 12. **--timeout rejects bad durations**: `start --timeout` with `1x`, `30ms`,
     `m`, `1m1h`, or `0s` exits 2 without starting anything.
+13. **every command has its own --help**: for each command, `COMMAND --help`
+    exits 0 and starts with `Usage: claffeinate COMMAND`, `help COMMAND`
+    prints the same text, and an unknown flag exits 2 naming
+    `claffeinate COMMAND --help`. `start --help` starts nothing, and
+    `help no-such-command` exits 2.
 
 ## Out of scope
 
