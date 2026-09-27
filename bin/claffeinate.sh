@@ -31,6 +31,9 @@ readonly CLAUDE_BIN_NAME="claude"
 # Anchored on `^sh -c` so the tagged caffeinate, whose argv also carries
 # the heartbeat text, never matches.
 readonly HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
+# How long `start` keeps the Mac awake when no --timeout is given. Each
+# `start` restarts the clock, so an agent that keeps calling it stays awake.
+readonly DEFAULT_TIMEOUT="10m"
 
 # ---------- pure detection ----------
 
@@ -77,6 +80,16 @@ list_orphaned_heartbeat_pids() {
   for pid in $(pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null); do
     pgrep -q -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || printf '%s\n' "$pid"
   done
+}
+
+stop_instance() {
+  # Stops the instance whose heartbeat is $1, along with the tagged
+  # caffeinate under it. Does nothing once $1 is no longer a heartbeat, so
+  # a stale pidfile whose PID has been reused can't stop anything else.
+  local pid="$1"
+  pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null | grep -qx -- "$pid" || return 0
+  pkill -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
 }
 
 tag_for_pid() {
@@ -218,9 +231,11 @@ usage_start() {
 Usage: claffeinate start [--display] [--idle] [--disk] [--system] [--user]
                          [--timeout DURATION]
 
-Keep this Mac awake on behalf of the current Claude Code tab, and print the
-PID of the instance. Running start again in the same tab starts nothing new
-and prints "already running: PID=N".
+Keep this Mac awake on behalf of the current Claude Code tab for 10 minutes,
+or for --timeout, and print the PID of the instance. A tab has one instance:
+running start again replaces it, with the new flags and a fresh timeout. Run
+start whenever the agent does something, and the Mac stays awake until it
+has been quiet for 10 minutes.
 
 Options (combine any; with none, --display is used):
   --display           keep the display from sleeping    (caffeinate -d)
@@ -228,8 +243,8 @@ Options (combine any; with none, --display is used):
   --disk              keep the disk from idle sleep     (caffeinate -m)
   --system            keep the system awake, on AC only (caffeinate -s)
   --user              declare that the user is active   (caffeinate -u)
-  --timeout DURATION  stop by itself after DURATION: 30s, 60m, 1h30m, 2d;
-                      a bare number is seconds
+  --timeout DURATION  stop by itself after DURATION instead of 10m:
+                      30s, 60m, 1h30m, 2d; a bare number is seconds
   --help              show this help
 
 Examples:
@@ -432,20 +447,20 @@ cmd_start() {
   if [ -z "$short_flags" ]; then
     short_flags="d"
   fi
+  if [ -z "$timeout" ]; then
+    timeout=$(duration_to_seconds "$DEFAULT_TIMEOUT")
+  fi
 
   local tag pidfile symlink caffeinate_bin
   tag="$(current_tag)"
   pidfile="${RUN_DIR}${tag}.pid"
   symlink="${TAG_DIR}${tag}"
 
-  if [ -f "$pidfile" ]; then
-    local existing
-    existing=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
-      printf "already running: PID=%s\n" "$existing"
-      return 0
-    fi
-  fi
+  # A tab has one instance. The new one replaces it, taking the latest
+  # flags and restarting the timeout; it starts before the old one stops,
+  # so the Mac is never left without an assertion in between.
+  local previous
+  previous=$(cat "$pidfile" 2>/dev/null || true)
 
   mkdir -p "$RUN_DIR" "$TAG_DIR"
   caffeinate_bin="$(command -v caffeinate || true)"
@@ -476,6 +491,9 @@ cmd_start() {
   printf '%s\n' "$pid" >"$pidfile"
   printf '%s\n' "$pid"
   disown "$pid" 2>/dev/null || true
+  if [ -n "$previous" ] && [ "$previous" != "$pid" ]; then
+    stop_instance "$previous"
+  fi
 }
 
 cmd_list() {

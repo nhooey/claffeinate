@@ -41,9 +41,9 @@ Claude Code instance — i.e. one terminal tab running Claude Code.
 - **No globals except readonly config.** `readonly TAG_PREFIX=...`,
   `readonly RUN_DIR=...`, `readonly TAG_DIR=...`. Anything else is a `local`
   inside a function or piped through stdin/stdout.
-- **Idempotent.** Running `start` twice in the same tab: the second call
-  detects the existing instance and exits 0 with a "already running, PID=N"
-  message — does not spawn a duplicate.
+- **One instance per tab.** Running `start` twice in the same tab: the
+  second call replaces the first instance, taking the new flags and a
+  fresh timeout, and leaves exactly one instance running.
 - **Composable output.** `list` emits one line per instance, tab-separated, suitable
   for `awk`/`cut`. A `--json` flag on `list` and `status` for machine consumption.
 - **No `set -e` traps for control flow.** Use explicit `||` and `if` for
@@ -84,7 +84,7 @@ Short option aliases (accepted; not used in docs):
 | `--disk`                 | `-m`   | `start`         | translates to `caffeinate -m`      |
 | `--system`               | `-s`   | `start`         | translates to `caffeinate -s`      |
 | `--user`                 | `-u`   | `start`         | translates to `caffeinate -u`      |
-| `--timeout DURATION`     | `-t`   | `start`         | heartbeat exits after DURATION     |
+| `--timeout DURATION`     | `-t`   | `start`         | heartbeat exits after DURATION (default 10m) |
 | `--json`                 | `-j`   | `list`/`status` | JSON output via `jq` (required)    |
 | `--dry-run`              | `-n`   | `kill-orphans`  | only print what would be killed    |
 | `--term-session-id ID`   | (none) | `claude-pid`    | required                           |
@@ -139,6 +139,8 @@ list_tagged_pids  ()                             -> one PID per line, all matchi
 tag_for_pid       (pid)                          -> echoes the tag (argv[0] basename); empty if none
 claude_pid_for    (term_sid, sse_port)           -> echoes claude PID; exit 1 if none
 tab_is_alive      (term_sid, sse_port)           -> exit 0 alive, 1 dead; no stdout
+stop_instance     (heartbeat_pid)                -> stops that heartbeat and its tagged caffeinate;
+                                                    no-op unless the PID is still a heartbeat
 ps_env            (pid)                          -> echoes env line from `ps -E`, stderr suppressed
 require_jq        ()                             -> exit 4 with a clear message if `jq` not on PATH
 ```
@@ -146,7 +148,7 @@ require_jq        ()                             -> exit 4 with a clear message 
 ### Mutation (subcommand bodies)
 
 ```
-cmd_start         (caffeinate_flags...)          -> spawns one instance, prints PID; idempotent
+cmd_start         (caffeinate_flags...)          -> spawns one instance, replacing this tab's; prints PID
 cmd_list          (--json?)                      -> table or JSON of {pid, tag, tab, dir, alive}
 cmd_status        (--json?)                      -> like list but also includes claude PID + uptime
 cmd_kill_mine     ()                             -> kills the instance owned by THIS tab
@@ -178,11 +180,11 @@ main (args...) -> case "$1" in start) cmd_start "${@:2}";; ... esac
    any combination. Default to `--display` if none given. DURATION is a bare
    number of seconds or `<number><unit>` parts in d/h/m/s order (`30s`,
    `60m`, `1h30m`, `2d`), converted to seconds by `duration_to_seconds`;
-   anything else, or a zero total, exits 2.
+   anything else, or a zero total, exits 2. Without `--timeout`, the timeout
+   is `DEFAULT_TIMEOUT` (`10m`), so every instance ends by itself.
 2. Compute `tag=$(current_tag)`.
-3. If `[ -f "${RUN_DIR}${tag}.pid" ]` and
-   `kill -0 "$(cat ${RUN_DIR}${tag}.pid)" 2>/dev/null`,
-   echo `already running: PID=<pid>` and return 0.
+3. Read the previous instance's heartbeat PID from `${RUN_DIR}${tag}.pid`,
+   if there is one.
 4. Ensure `${RUN_DIR}` and `${TAG_DIR}` exist (`mkdir -p`); create symlink
    `${TAG_DIR}${tag} -> $(command -v caffeinate)`.
 5. Translate the parsed long flags back to caffeinate's short forms and exec
@@ -197,6 +199,11 @@ main (args...) -> case "$1" in start) cmd_start "${@:2}";; ... esac
      (`pgrep -q -P $$ -f`), since killing only the caffeinate would otherwise
      leave it running under launchd until reboot.
 6. Write PID to `${RUN_DIR}${tag}.pid`. Echo the PID.
+7. Stop the previous instance with `stop_instance`. The new instance starts
+   first, so the Mac is never left without an assertion in between. Because
+   each `start` restarts the timeout, a caller that runs `start` on every
+   bit of agent activity (the README's Claude Code hooks) keeps the Mac
+   awake until the agent has been quiet for the timeout.
 
 ### `cmd_list`
 
@@ -290,8 +297,10 @@ Implemented as `claude_pid_for "$@" >/dev/null`.
 Ship as `tests/test.sh` invoking the script as a subprocess. Each test prints
 `PASS <name>` or `FAIL <name>: <reason>`; exit non-zero on any FAIL.
 
-1. **start is idempotent**: `claffeinate start` twice in the same shell → second
-   call exits 0 with `already running` and only one tagged process exists.
+1. **start replaces**: `claffeinate start` runs with a 600-second timeout;
+   a second `claffeinate start --idle --timeout 1h` in the same shell prints
+   a new PID, the first heartbeat is gone, and exactly one tagged process
+   exists, with `-i` and a 3600-second timeout.
 2. **list shows the instance**: after `claffeinate start`, `claffeinate list`
    includes a row with the matching tab + dir + `alive`.
 3. **kill-mine removes it**: after `claffeinate kill-mine`, `claffeinate list`

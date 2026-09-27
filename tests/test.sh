@@ -101,35 +101,50 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Test 1: start is idempotent
+# Test 1: start replaces this tab's instance, with a 10m default timeout
 # ---------------------------------------------------------------------------
-test_start_idempotent() {
+test_start_replaces() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip start_idempotent "macOS system-binary exec blocked (build sandbox); needs caffeinate(1)"
+    skip start_replaces "macOS system-binary exec blocked (build sandbox); needs caffeinate(1)"
     return
   fi
-  local out1 out2 tagged_count
-  out1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+  local tag_pattern="caffeinate--claffeinate--tab-${TEST_TERM_SID}-${TEST_SSE_PORT}--"
+  local pid1 pid2 tagged
+  pid1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
     "${CLAFF[@]}" start 2>&1) || {
-    fail start_idempotent "first start failed: $out1"
+    fail start_replaces "first start failed: $pid1"
     return
   }
   sleep 0.3
-  out2=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "${CLAFF[@]}" start 2>&1) || {
-    fail start_idempotent "second start failed: $out2"
+  tagged=$(pgrep -a -lf -- "$tag_pattern" 2>/dev/null)
+  if [[ $tagged != *" 600" ]]; then
+    fail start_replaces "start without --timeout should expire after 600s: $tagged"
+    return
+  fi
+  pid2=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" start --idle --timeout 1h 2>&1) || {
+    fail start_replaces "second start failed: $pid2"
     return
   }
-  if [[ $out2 != *"already running"* ]]; then
-    fail start_idempotent "second start did not say 'already running': $out2"
+  sleep 0.3
+  if [ "$pid1" = "$pid2" ]; then
+    fail start_replaces "second start kept PID $pid1"
     return
   fi
-  tagged_count=$(pgrep -a -f -- "caffeinate--claffeinate--tab-${TEST_TERM_SID}-${TEST_SSE_PORT}--" 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$tagged_count" != "1" ]; then
-    fail start_idempotent "expected 1 tagged process, found $tagged_count"
+  if kill -0 "$pid1" 2>/dev/null; then
+    fail start_replaces "first instance's heartbeat $pid1 still running"
     return
   fi
-  pass start_idempotent
+  tagged=$(pgrep -a -lf -- "$tag_pattern" 2>/dev/null)
+  if [ "$(printf '%s\n' "$tagged" | grep -c .)" != "1" ]; then
+    fail start_replaces "expected 1 tagged process, found: $tagged"
+    return
+  fi
+  if [[ $tagged != *" -i sh -c "* ]] || [[ $tagged != *" 3600" ]]; then
+    fail start_replaces "replacement didn't take --idle --timeout 1h: $tagged"
+    return
+  fi
+  pass start_replaces
 }
 
 # ---------------------------------------------------------------------------
@@ -137,7 +152,7 @@ test_start_idempotent() {
 # ---------------------------------------------------------------------------
 test_list_shows_instance() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip list_shows_instance "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    skip list_shows_instance "depends on test_start_replaces (caffeinate(1) exec blocked)"
     return
   fi
   local out
@@ -158,7 +173,7 @@ test_list_shows_instance() {
 # ---------------------------------------------------------------------------
 test_kill_mine() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip kill_mine "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    skip kill_mine "depends on test_start_replaces (caffeinate(1) exec blocked)"
     return
   fi
   local out tag
@@ -525,7 +540,7 @@ test_per_command_help() {
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
-test_start_idempotent
+test_start_replaces
 test_list_shows_instance
 test_kill_mine
 test_kill_orphans_alive_noop

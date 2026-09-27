@@ -1,7 +1,7 @@
 # claffeinate
 
 **Keep your Mac awake while Claude Code works, and let it sleep once the
-work is done, even when a tab crashes.**
+work stops, even when a tab crashes.**
 
 ## The problem
 
@@ -29,8 +29,13 @@ the process after that tab. Every instance then answers two questions:
 *which tab owns me?* and *is that tab still open?* That lets claffeinate
 stop exactly the instances whose tab is gone, and leave the rest alone.
 
+Each instance lasts 10 minutes, and each `start` replaces the tab's
+instance with a fresh one. So when Claude Code runs `start` every time it
+does something, the Mac stays awake while the agent works, and sleeps
+normally once it has been quiet for 10 minutes.
+
 ```sh
-claffeinate start          # keep the Mac awake for this tab
+claffeinate start          # keep the Mac awake for this tab, for 10 minutes
 claffeinate list           # every instance, and whether its tab is open
 claffeinate kill-orphans   # stop the ones whose tab has closed
 ```
@@ -68,7 +73,7 @@ From a checkout, link the script onto your `PATH` without its `.sh`:
 ln -s "$PWD/bin/claffeinate.sh" ~/bin/claffeinate
 ```
 
-### 2. Have Claude Code start and stop it
+### 2. Have Claude Code run it as it works
 
 Claude Code [hooks](https://code.claude.com/docs/en/hooks) run
 inside the tab's environment, which is what claffeinate reads to tag an
@@ -77,7 +82,10 @@ instance. Add this to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "SessionStart": [
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "claffeinate start --idle >/dev/null" }] }
+    ],
+    "PreToolUse": [
       { "hooks": [{ "type": "command", "command": "claffeinate start --idle >/dev/null" }] }
     ],
     "SessionEnd": [
@@ -87,13 +95,17 @@ instance. Add this to `~/.claude/settings.json`:
 }
 ```
 
-A tab that exits normally now cleans up after itself. `start` is safe to run
-again: a tab that already has an instance keeps it.
+Now every prompt you send, and every tool the agent runs, gives the Mac
+another 10 minutes awake. When the agent finishes, the last instance runs
+out and the Mac is free to sleep. A tab that you exit stops its instance
+straight away. A `start` takes about 70 ms, so running one before every
+tool call doesn't slow the agent down.
 
 ### 3. Reap what crashed tabs leave behind
 
 A tab that crashes, or a window closed without exiting, never runs its
-`SessionEnd` hook. Reap those at shell startup, in the background so the
+`SessionEnd` hook. Its instance still runs out after 10 minutes, but you
+can also reap those at shell startup, in the background so the
 shell isn't slowed down. This works in `~/.zshrc`, `~/.bashrc` or
 `~/.config/fish/config.fish`:
 
@@ -110,7 +122,7 @@ Every command has its own help: `claffeinate COMMAND --help`, or
 
 | Command                        | What it does                                                            |
 | ------------------------------ | ----------------------------------------------------------------------- |
-| `start [flags]`                | Keep the Mac awake for this tab. Prints the PID.                        |
+| `start [flags]`                | Keep the Mac awake for this tab, for 10 minutes. Prints the PID.        |
 | `list [--json]`                | One row per instance: PID, tab, SSE port, directory, `alive` or `dead`. |
 | `status [--json]`              | `list`, plus the owning `claude` PID and uptime in seconds.             |
 | `kill-mine`                    | Stop this tab's instance. Exits 3 if it has none.                       |
@@ -119,7 +131,10 @@ Every command has its own help: `claffeinate COMMAND --help`, or
 
 ### `start`
 
-With no flags, `start` keeps the display from sleeping. The flags map to `caffeinate`'s own, and combine freely:
+With no flags, `start` keeps the display from sleeping for 10 minutes. A
+tab has one instance: running `start` again replaces it, with the new flags
+and a fresh timeout. The flags map to `caffeinate`'s own, and combine
+freely:
 
 | Flag                 | Keeps…                                 | `caffeinate` |
 | -------------------- | -------------------------------------- | ------------ |
@@ -128,14 +143,14 @@ With no flags, `start` keeps the display from sleeping. The flags map to `caffei
 | `--disk`             | the disk from idle sleep               | `-m`         |
 | `--system`           | the system awake, on AC power only     | `-s`         |
 | `--user`             | the user marked as active              | `-u`         |
-| `--timeout DURATION` | it running for DURATION only           |              |
+| `--timeout DURATION` | it running for DURATION, not 10m       |              |
 
 DURATION is a number with units, largest first: `30s`, `45m`, `1h30m`, `2d`.
 A bare number is seconds.
 
 ```sh
 claffeinate start --idle                 # screen can dim; the work goes on
-claffeinate start --idle --timeout 2h    # and stop by itself after two hours
+claffeinate start --idle --timeout 2h    # the same, for two hours instead
 ```
 
 ### Scripting with `--json`
@@ -148,6 +163,21 @@ claffeinate status --json | jq '.[] | select(.alive) | {dir, uptime_seconds}'
 ```
 
 ## How it works
+
+### Knowing the agent is working
+
+claffeinate doesn't watch the agent. It relies on two signals, and each one
+answers a different question:
+
+- **Is the agent busy? Ask the hooks.** Claude Code runs a hook when you
+  send a prompt and before every tool call. Each one runs `start`, which
+  pushes the 10-minute deadline back. While the agent is working, the
+  deadline keeps moving. Once it goes quiet, the deadline arrives and the
+  instance exits.
+- **Is the tab still open? Ask the process table.** This decides what
+  `list` shows as `dead` and what `kill-orphans` stops. It says nothing
+  about whether the agent is busy: a tab left open at an idle prompt is
+  still `alive`.
 
 ### Tagging
 
@@ -182,8 +212,8 @@ Each instance runs a small shell loop, which is the command `caffeinate`
 keeps awake for. Once a minute it writes `awake` to
 `/tmp/claffeinate/<tag>.log`. The loop is also what ends the instance:
 
-- **`--timeout`:** it exits once the timeout passes, and `caffeinate`
-  exits with it.
+- **The timeout:** it exits once the timeout passes, 10 minutes unless
+  `--timeout` says otherwise, and `caffeinate` exits with it.
 - **A killed `caffeinate`:** the loop notices and exits too, so no loop is
   left running on its own.
 
@@ -192,6 +222,10 @@ claffeinate handled that case.
 
 ## Limits
 
+- **One long tool call gets 10 minutes.** Hooks fire between tool calls, not
+  during them, so a single build or test run longer than 10 minutes can
+  outlast its instance. If yours run that long, give the `PreToolUse` hook
+  a longer `--timeout`, such as `--timeout 1h`.
 - **Outside an IDE, every instance looks orphaned.** Claude Code sets
   `CLAUDE_CODE_SSE_PORT` only when it's connected to an IDE. Without it, an
   instance is tagged `noport`, no `claude` process can match it, and
