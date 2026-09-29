@@ -92,6 +92,32 @@ stop_instance() {
   kill "$pid" 2>/dev/null || true
 }
 
+lock_tag() {
+  # Serializes `start` within one tab. The plugin's hooks fire together
+  # when the agent runs tools in parallel, and two starts left to race
+  # would each spawn an instance and lose track of one. The lock is a
+  # symlink whose target is the holder's PID, created atomically by
+  # `ln -s`, so there is never a lock without a holder; a lock whose holder
+  # has died is taken over. Gives up after about 10 seconds.
+  local lock="$1" holder tries=0
+  until ln -s "$$" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock"
+      continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] || return 1
+    sleep 0.05
+  done
+}
+
+unlock_tag() {
+  local lock="$1"
+  [ "$(readlink "$lock" 2>/dev/null || true)" = "$$" ] && rm -f "$lock"
+  return 0
+}
+
 tag_for_pid() {
   # Returns the basename of argv[0] for $pid, but only when it begins with
   # our TAG_PREFIX -- which is the only case any caller cares about. Uses
@@ -451,23 +477,28 @@ cmd_start() {
     timeout=$(duration_to_seconds "$DEFAULT_TIMEOUT")
   fi
 
-  local tag pidfile symlink caffeinate_bin
+  local tag pidfile symlink lock caffeinate_bin
   tag="$(current_tag)"
   pidfile="${RUN_DIR}${tag}.pid"
   symlink="${TAG_DIR}${tag}"
+  lock="${RUN_DIR}${tag}.lock"
+
+  caffeinate_bin="$(command -v caffeinate || true)"
+  if [ -z "$caffeinate_bin" ]; then
+    printf "error: caffeinate not found on PATH\n" >&2
+    return 1
+  fi
+  mkdir -p "$RUN_DIR" "$TAG_DIR"
+  if ! lock_tag "$lock"; then
+    printf "error: another start in this tab still holds %s\n" "$lock" >&2
+    return 1
+  fi
 
   # A tab has one instance. The new one replaces it, taking the latest
   # flags and restarting the timeout; it starts before the old one stops,
   # so the Mac is never left without an assertion in between.
   local previous
   previous=$(cat "$pidfile" 2>/dev/null || true)
-
-  mkdir -p "$RUN_DIR" "$TAG_DIR"
-  caffeinate_bin="$(command -v caffeinate || true)"
-  if [ -z "$caffeinate_bin" ]; then
-    printf "error: caffeinate not found on PATH\n" >&2
-    return 1
-  fi
   # The symlink stays as a kill-mine fallback marker (its presence /
   # removal is part of the contract), but we never exec it -- some
   # sandboxes (notably sandboxed macOS Nix builds) block exec on the
@@ -494,6 +525,7 @@ cmd_start() {
   if [ -n "$previous" ] && [ "$previous" != "$pid" ]; then
     stop_instance "$previous"
   fi
+  unlock_tag "$lock"
 }
 
 cmd_list() {

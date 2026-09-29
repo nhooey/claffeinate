@@ -55,9 +55,38 @@ built-ins, apart from `jq` for `--json` output.
 
 ## Quick start
 
-### 1. Install
+### 1. Install the Claude Code plugin
 
-With Nix:
+In Claude Code:
+
+```
+/plugin marketplace add nhooey/claffeinate
+/plugin install claffeinate@claffeinate
+```
+
+That's all it takes to keep the Mac awake while the agent works. The
+plugin's [hooks](https://code.claude.com/docs/en/hooks) run claffeinate at
+each step of the agent's work:
+
+| When                                  | claffeinate                                 |
+| ------------------------------------- | ------------------------------------------- |
+| You send a prompt                     | awake for the next 10 minutes               |
+| A tool call starts                    | awake until it ends, for up to 2 hours      |
+| A tool call ends, or the turn ends    | awake for the next 10 minutes               |
+| You exit Claude Code                  | stops this tab's instance                   |
+
+So the Mac stays awake while the agent works, including through a long
+build, and can sleep 10 minutes after it goes quiet. Each step takes about
+70 ms, so the agent doesn't slow down. On a machine without `caffeinate`,
+such as Linux, the hooks do nothing.
+
+The plugin also puts `claffeinate.sh` on the agent's `PATH`, so you can
+ask Claude which instances are running, or to stop one.
+
+### 2. Install the command, for your terminal
+
+The plugin runs its own copy of the script. To use `list`, `status` and
+`kill-orphans` from your shell, install the command too. With Nix:
 
 ```sh
 nix profile install github:nhooey/claffeinate   # persistent
@@ -73,39 +102,12 @@ From a checkout, link the script onto your `PATH` without its `.sh`:
 ln -s "$PWD/bin/claffeinate.sh" ~/bin/claffeinate
 ```
 
-### 2. Have Claude Code run it as it works
-
-Claude Code [hooks](https://code.claude.com/docs/en/hooks) run
-inside the tab's environment, which is what claffeinate reads to tag an
-instance. Add this to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "claffeinate start --idle >/dev/null" }] }
-    ],
-    "PreToolUse": [
-      { "hooks": [{ "type": "command", "command": "claffeinate start --idle >/dev/null" }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "claffeinate kill-mine || true" }] }
-    ]
-  }
-}
-```
-
-Now every prompt you send, and every tool the agent runs, gives the Mac
-another 10 minutes awake. When the agent finishes, the last instance runs
-out and the Mac is free to sleep. A tab that you exit stops its instance
-straight away. A `start` takes about 70 ms, so running one before every
-tool call doesn't slow the agent down.
-
 ### 3. Reap what crashed tabs leave behind
 
 A tab that crashes, or a window closed without exiting, never runs its
-`SessionEnd` hook. Its instance still runs out after 10 minutes, but you
-can also reap those at shell startup, in the background so the
+`SessionEnd` hook. Its instance still runs out by itself: 10 minutes after
+its last step, or up to 2 hours if it crashed during a tool call. To reap
+those sooner, run `kill-orphans` at shell startup, in the background so the
 shell isn't slowed down. This works in `~/.zshrc`, `~/.bashrc` or
 `~/.config/fish/config.fish`:
 
@@ -169,11 +171,13 @@ claffeinate status --json | jq '.[] | select(.alive) | {dir, uptime_seconds}'
 claffeinate doesn't watch the agent. It relies on two signals, and each one
 answers a different question:
 
-- **Is the agent busy? Ask the hooks.** Claude Code runs a hook when you
-  send a prompt and before every tool call. Each one runs `start`, which
-  pushes the 10-minute deadline back. While the agent is working, the
-  deadline keeps moving. Once it goes quiet, the deadline arrives and the
-  instance exits.
+- **Is the agent busy? Ask the hooks.** Claude Code runs the plugin's hooks
+  when you send a prompt, around every tool call, and when a turn ends.
+  Each one runs `start`, which replaces the tab's instance and so resets
+  its deadline. While the agent is working, the deadline keeps moving. Once
+  it goes quiet, the deadline arrives and the instance exits. No hook fires
+  during a tool call, so the one before it allows up to 2 hours, and the
+  one after it brings the deadline back to 10 minutes.
 - **Is the tab still open? Ask the process table.** This decides what
   `list` shows as `dead` and what `kill-orphans` stops. It says nothing
   about whether the agent is busy: a tab left open at an idle prompt is
@@ -220,18 +224,44 @@ keeps awake for. Once a minute it writes `awake` to
 `kill-orphans` also stops loops that lost their `caffeinate` before
 claffeinate handled that case.
 
+### Parallel tool calls
+
+When the agent runs several tools at once, their hooks run `start` at the
+same moment. Starts in one tab take turns through a lock, so however many
+arrive together, the tab ends up with exactly one instance.
+
+### Without the plugin
+
+The plugin is a set of hooks around `hooks/claffeinate-hook.sh`. To wire it
+up by hand instead, point your own hooks in `~/.claude/settings.json` at a
+checkout, with the event names from `hooks/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "hooks": [{ "type": "command", "command": "bash ~/src/claffeinate/hooks/claffeinate-hook.sh pre-tool" }] }
+    ]
+  }
+}
+```
+
+The script takes `prompt`, `pre-tool`, `post-tool`, `stop` and
+`session-end`. It never fails and never prints, so it can't interrupt the
+agent.
+
 ## Limits
 
-- **One long tool call gets 10 minutes.** Hooks fire between tool calls, not
-  during them, so a single build or test run longer than 10 minutes can
-  outlast its instance. If yours run that long, give the `PreToolUse` hook
-  a longer `--timeout`, such as `--timeout 1h`.
+- **A tool call gets up to 2 hours.** A single tool call that runs longer
+  can outlast its instance. With parallel tool calls, the first one to
+  finish brings the deadline back to 10 minutes while the others may still
+  be running.
 - **Outside an IDE, every instance looks orphaned.** Claude Code sets
   `CLAUDE_CODE_SSE_PORT` only when it's connected to an IDE. Without it, an
   instance is tagged `noport`, no `claude` process can match it, and
   `kill-orphans` stops it even while its tab is working. If you run Claude
-  Code in a plain terminal, rely on the `SessionEnd` hook and `--timeout`,
-  and leave `kill-orphans` out of your shell startup.
+  Code in a plain terminal, let the plugin's deadlines do the work, and
+  leave `kill-orphans` out of your shell startup.
 - **Terminals without `TERM_SESSION_ID`.** macOS Terminal, iTerm2 and
   JetBrains terminals set it; most SSH sessions don't. There the tag says
   `unknown`, and those instances are also treated as orphans.
@@ -251,8 +281,10 @@ claffeinate handled that case.
 ## Development
 
 ```sh
-tests/test.sh      # acceptance tests
-nix flake check    # shellcheck and the tests
+tests/test.sh                          # acceptance tests
+nix flake check                        # shellcheck and the tests
+claude plugin validate .               # the plugin and marketplace manifests
+claude --plugin-dir . -p "…"           # try the plugin from this checkout
 ```
 
 The tests use made-up tab IDs, so they don't touch your real instances. Two
