@@ -31,6 +31,9 @@ readonly CLAUDE_BIN_NAME="claude"
 # Anchored on `^sh -c` so the tagged caffeinate, whose argv also carries
 # the heartbeat text, never matches.
 readonly HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
+# How long `start` keeps the Mac awake when no --timeout is given. Each
+# `start` restarts the clock, so an agent that keeps calling it stays awake.
+readonly DEFAULT_TIMEOUT="10m"
 
 # ---------- pure detection ----------
 
@@ -77,6 +80,42 @@ list_orphaned_heartbeat_pids() {
   for pid in $(pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null); do
     pgrep -q -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || printf '%s\n' "$pid"
   done
+}
+
+stop_instance() {
+  # Stops the instance whose heartbeat is $1, along with the tagged
+  # caffeinate under it. Does nothing once $1 is no longer a heartbeat, so
+  # a stale pidfile whose PID has been reused can't stop anything else.
+  local pid="$1"
+  pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null | grep -qx -- "$pid" || return 0
+  pkill -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+}
+
+lock_tag() {
+  # Serializes `start` within one tab. The plugin's hooks fire together
+  # when the agent runs tools in parallel, and two starts left to race
+  # would each spawn an instance and lose track of one. The lock is a
+  # symlink whose target is the holder's PID, created atomically by
+  # `ln -s`, so there is never a lock without a holder; a lock whose holder
+  # has died is taken over. Gives up after about 10 seconds.
+  local lock="$1" holder tries=0
+  until ln -s "$$" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock"
+      continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] || return 1
+    sleep 0.05
+  done
+}
+
+unlock_tag() {
+  local lock="$1"
+  [ "$(readlink "$lock" 2>/dev/null || true)" = "$$" ] && rm -f "$lock"
+  return 0
 }
 
 tag_for_pid() {
@@ -180,27 +219,29 @@ duration_to_seconds() {
   printf '%d\n' "$total"
 }
 
+# ---------- help ----------
+
 usage() {
   cat <<'EOF'
-claffeinate -- tag caffeinate instances with the Claude Code tab that owns them
+claffeinate -- keep your Mac awake while Claude Code works, one tab at a time
+
+Each caffeinate(1) instance is tagged with the Claude Code tab that started
+it, so a closed tab's keep-awake can be found and stopped without touching
+the ones other tabs still need.
 
 Usage:
-  claffeinate start [--display|--idle|--disk|--system|--user|--timeout DURATION]...
-  claffeinate list   [--json]
-  claffeinate status [--json]
-  claffeinate kill-mine
-  claffeinate kill-orphans [--dry-run]
-  claffeinate claude-pid --term-session-id ID --sse-port PORT
-  claffeinate help
-  claffeinate [--help]
+  claffeinate <command> [options]
 
-Flags for `start` (no flag: defaults to --display):
-  --display    prevent display sleep         (caffeinate -d)
-  --idle       prevent idle sleep            (caffeinate -i)
-  --disk       prevent disk sleep            (caffeinate -m)
-  --system     prevent system sleep on AC    (caffeinate -s)
-  --user       declare user is active        (caffeinate -u)
-  --timeout D  expire after D: 30s, 60m, 1h30m, 2d (bare number: seconds)
+Commands:
+  start           keep this Mac awake on behalf of this tab
+  list            list every instance and whether its tab is still open
+  status          list, plus each owning claude PID and uptime
+  kill-mine       stop this tab's instance
+  kill-orphans    stop every instance whose tab has closed
+  claude-pid      find the claude process behind a tab
+  help [COMMAND]  show this help, or a command's
+
+Run 'claffeinate COMMAND --help' for a command's options and examples.
 
 Exit codes:
   0  success
@@ -209,6 +250,151 @@ Exit codes:
   3  nothing matched
   4  --json requested but jq is not installed
 EOF
+}
+
+usage_start() {
+  cat <<'EOF'
+Usage: claffeinate start [--display] [--idle] [--disk] [--system] [--user]
+                         [--timeout DURATION]
+
+Keep this Mac awake on behalf of the current Claude Code tab for 10 minutes,
+or for --timeout, and print the PID of the instance. A tab has one instance:
+running start again replaces it, with the new flags and a fresh timeout. Run
+start whenever the agent does something, and the Mac stays awake until it
+has been quiet for 10 minutes.
+
+Options (combine any; with none, --display is used):
+  --display           keep the display from sleeping    (caffeinate -d)
+  --idle              keep the system from idle sleep   (caffeinate -i)
+  --disk              keep the disk from idle sleep     (caffeinate -m)
+  --system            keep the system awake, on AC only (caffeinate -s)
+  --user              declare that the user is active   (caffeinate -u)
+  --timeout DURATION  stop by itself after DURATION instead of 10m:
+                      30s, 60m, 1h30m, 2d; a bare number is seconds
+  --help              show this help
+
+Examples:
+  claffeinate start
+  claffeinate start --idle --display
+  claffeinate start --timeout 1h30m
+EOF
+}
+
+usage_list() {
+  cat <<'EOF'
+Usage: claffeinate list [--json]
+
+List every claffeinate instance on this Mac, one tab-separated row each:
+
+  PID  TERM_SESSION_ID  SSE_PORT  DIR  alive|dead
+
+"dead" means no running Claude Code tab matches the instance, so
+kill-orphans would stop it.
+
+Options:
+  --json  print a JSON array instead (needs jq)
+  --help  show this help
+
+Example:
+  claffeinate list --json | jq '.[] | select(.alive | not)'
+EOF
+}
+
+usage_status() {
+  cat <<'EOF'
+Usage: claffeinate status [--json]
+
+Like list, with two more columns: the PID of the claude process that owns
+the instance ("-" once its tab has closed), and how long the instance has
+been running.
+
+  PID  TERM_SESSION_ID  SSE_PORT  DIR  alive|dead  CLAUDE_PID  UPTIME_SECONDS
+
+Warns on stderr if no claude process is running at all.
+
+Options:
+  --json  print a JSON array instead (needs jq)
+  --help  show this help
+EOF
+}
+
+usage_kill_mine() {
+  cat <<'EOF'
+Usage: claffeinate kill-mine
+
+Stop the instance this Claude Code tab started, and remove its pidfile and
+symlink. Instances from other tabs are left alone. Exits 3 if this tab has
+no instance.
+
+Options:
+  --help  show this help
+EOF
+}
+
+usage_kill_orphans() {
+  cat <<'EOF'
+Usage: claffeinate kill-orphans [--dry-run]
+
+Stop every instance whose Claude Code tab has closed, and every heartbeat
+loop that has lost its caffeinate. An instance whose tab is still open is
+never touched. An instance started outside Claude Code has no tab to match,
+so it always counts as an orphan.
+
+Prints one line for each process it stops:
+
+  killed PID TAG
+  killed PID heartbeat
+
+Options:
+  --dry-run  print "would kill ..." instead, and stop nothing
+  --help     show this help
+
+Example, reaping in the background at shell startup:
+  command -v claffeinate >/dev/null && claffeinate kill-orphans >/dev/null 2>&1 &
+EOF
+}
+
+usage_claude_pid() {
+  cat <<'EOF'
+Usage: claffeinate claude-pid --term-session-id ID --sse-port PORT
+
+Print the PID of the claude process whose environment has both
+TERM_SESSION_ID=ID and CLAUDE_CODE_SSE_PORT=PORT. This is the check that
+decides whether an instance's tab is still open. Exits 1 if no claude
+process matches.
+
+Options:
+  --term-session-id ID  the tab's TERM_SESSION_ID (required)
+  --sse-port PORT       the tab's CLAUDE_CODE_SSE_PORT (required)
+  --help                show this help
+
+Example:
+  claffeinate claude-pid --term-session-id "$TERM_SESSION_ID" \
+    --sse-port "$CLAUDE_CODE_SSE_PORT"
+EOF
+}
+
+# Prints a command's help, or the overview when no command is given.
+cmd_help() {
+  case "${1:-}" in
+  "") usage ;;
+  start) usage_start ;;
+  list) usage_list ;;
+  status) usage_status ;;
+  kill-mine) usage_kill_mine ;;
+  kill-orphans) usage_kill_orphans ;;
+  claude-pid) usage_claude_pid ;;
+  *)
+    printf "error: unknown command: %s (see 'claffeinate --help')\n" "$1" >&2
+    return 2
+    ;;
+  esac
+}
+
+# Reports a flag the command doesn't accept, and where its flags are listed.
+unknown_flag() {
+  printf "error: unknown flag for %s: %s (see 'claffeinate %s --help')\n" \
+    "$1" "$2" "$1" >&2
 }
 
 # ---------- shared row emitter ----------
@@ -274,11 +460,11 @@ cmd_start() {
       shift 2
       ;;
     --help | -h)
-      usage
+      usage_start
       return 0
       ;;
     *)
-      printf "error: unknown flag: %s\n" "$1" >&2
+      unknown_flag start "$1"
       return 2
       ;;
     esac
@@ -287,27 +473,32 @@ cmd_start() {
   if [ -z "$short_flags" ]; then
     short_flags="d"
   fi
+  if [ -z "$timeout" ]; then
+    timeout=$(duration_to_seconds "$DEFAULT_TIMEOUT")
+  fi
 
-  local tag pidfile symlink caffeinate_bin
+  local tag pidfile symlink lock caffeinate_bin
   tag="$(current_tag)"
   pidfile="${RUN_DIR}${tag}.pid"
   symlink="${TAG_DIR}${tag}"
+  lock="${RUN_DIR}${tag}.lock"
 
-  if [ -f "$pidfile" ]; then
-    local existing
-    existing=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
-      printf "already running: PID=%s\n" "$existing"
-      return 0
-    fi
-  fi
-
-  mkdir -p "$RUN_DIR" "$TAG_DIR"
   caffeinate_bin="$(command -v caffeinate || true)"
   if [ -z "$caffeinate_bin" ]; then
     printf "error: caffeinate not found on PATH\n" >&2
     return 1
   fi
+  mkdir -p "$RUN_DIR" "$TAG_DIR"
+  if ! lock_tag "$lock"; then
+    printf "error: another start in this tab still holds %s\n" "$lock" >&2
+    return 1
+  fi
+
+  # A tab has one instance. The new one replaces it, taking the latest
+  # flags and restarting the timeout; it starts before the old one stops,
+  # so the Mac is never left without an assertion in between.
+  local previous
+  previous=$(cat "$pidfile" 2>/dev/null || true)
   # The symlink stays as a kill-mine fallback marker (its presence /
   # removal is part of the contract), but we never exec it -- some
   # sandboxes (notably sandboxed macOS Nix builds) block exec on the
@@ -331,6 +522,10 @@ cmd_start() {
   printf '%s\n' "$pid" >"$pidfile"
   printf '%s\n' "$pid"
   disown "$pid" 2>/dev/null || true
+  if [ -n "$previous" ] && [ "$previous" != "$pid" ]; then
+    stop_instance "$previous"
+  fi
+  unlock_tag "$lock"
 }
 
 cmd_list() {
@@ -342,11 +537,11 @@ cmd_list() {
       shift
       ;;
     --help | -h)
-      usage
+      usage_list
       return 0
       ;;
     *)
-      printf "error: unknown flag: %s\n" "$1" >&2
+      unknown_flag list "$1"
       return 2
       ;;
     esac
@@ -377,11 +572,11 @@ cmd_status() {
       shift
       ;;
     --help | -h)
-      usage
+      usage_status
       return 0
       ;;
     *)
-      printf "error: unknown flag: %s\n" "$1" >&2
+      unknown_flag status "$1"
       return 2
       ;;
     esac
@@ -436,6 +631,19 @@ cmd_status() {
 }
 
 cmd_kill_mine() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --help | -h)
+      usage_kill_mine
+      return 0
+      ;;
+    *)
+      unknown_flag kill-mine "$1"
+      return 2
+      ;;
+    esac
+  done
+
   local tag pidfile symlink killed=0
   tag="$(current_tag)"
   pidfile="${RUN_DIR}${tag}.pid"
@@ -469,11 +677,11 @@ cmd_kill_orphans() {
       shift
       ;;
     --help | -h)
-      usage
+      usage_kill_orphans
       return 0
       ;;
     *)
-      printf "error: unknown flag: %s\n" "$1" >&2
+      unknown_flag kill-orphans "$1"
       return 2
       ;;
     esac
@@ -539,11 +747,11 @@ cmd_claude_pid() {
       shift 2
       ;;
     --help | -h)
-      usage
+      usage_claude_pid
       return 0
       ;;
     *)
-      printf "error: unknown flag: %s\n" "$1" >&2
+      unknown_flag claude-pid "$1"
       return 2
       ;;
     esac
@@ -591,9 +799,13 @@ main() {
     shift
     cmd_claude_pid "$@"
     ;;
-  help | --help | -h) usage ;;
+  help)
+    shift
+    cmd_help "$@"
+    ;;
+  --help | -h) usage ;;
   *)
-    printf "error: unknown subcommand: %s\n" "$1" >&2
+    printf "error: unknown command: %s (see 'claffeinate --help')\n" "$1" >&2
     return 2
     ;;
   esac

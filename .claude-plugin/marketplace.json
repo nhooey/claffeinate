@@ -1,0 +1,14 @@
+{
+  "name": "claffeinate",
+  "description": "The claffeinate plugin: keep your Mac awake while Claude Code works.",
+  "owner": {
+    "name": "Neil Hooey"
+  },
+  "plugins": [
+    {
+      "name": "claffeinate",
+      "source": "./",
+      "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes."
+    }
+  ]
+}

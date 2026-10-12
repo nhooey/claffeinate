@@ -101,35 +101,50 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Test 1: start is idempotent
+# Test 1: start replaces this tab's instance, with a 10m default timeout
 # ---------------------------------------------------------------------------
-test_start_idempotent() {
+test_start_replaces() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip start_idempotent "macOS system-binary exec blocked (build sandbox); needs caffeinate(1)"
+    skip start_replaces "macOS system-binary exec blocked (build sandbox); needs caffeinate(1)"
     return
   fi
-  local out1 out2 tagged_count
-  out1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+  local tag_pattern="caffeinate--claffeinate--tab-${TEST_TERM_SID}-${TEST_SSE_PORT}--"
+  local pid1 pid2 tagged
+  pid1=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
     "${CLAFF[@]}" start 2>&1) || {
-    fail start_idempotent "first start failed: $out1"
+    fail start_replaces "first start failed: $pid1"
     return
   }
   sleep 0.3
-  out2=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
-    "${CLAFF[@]}" start 2>&1) || {
-    fail start_idempotent "second start failed: $out2"
+  tagged=$(pgrep -a -lf -- "$tag_pattern" 2>/dev/null)
+  if [[ $tagged != *" 600" ]]; then
+    fail start_replaces "start without --timeout should expire after 600s: $tagged"
+    return
+  fi
+  pid2=$(TERM_SESSION_ID="$TEST_TERM_SID" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" start --idle --timeout 1h 2>&1) || {
+    fail start_replaces "second start failed: $pid2"
     return
   }
-  if [[ $out2 != *"already running"* ]]; then
-    fail start_idempotent "second start did not say 'already running': $out2"
+  sleep 0.3
+  if [ "$pid1" = "$pid2" ]; then
+    fail start_replaces "second start kept PID $pid1"
     return
   fi
-  tagged_count=$(pgrep -a -f -- "caffeinate--claffeinate--tab-${TEST_TERM_SID}-${TEST_SSE_PORT}--" 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$tagged_count" != "1" ]; then
-    fail start_idempotent "expected 1 tagged process, found $tagged_count"
+  if kill -0 "$pid1" 2>/dev/null; then
+    fail start_replaces "first instance's heartbeat $pid1 still running"
     return
   fi
-  pass start_idempotent
+  tagged=$(pgrep -a -lf -- "$tag_pattern" 2>/dev/null)
+  if [ "$(printf '%s\n' "$tagged" | grep -c .)" != "1" ]; then
+    fail start_replaces "expected 1 tagged process, found: $tagged"
+    return
+  fi
+  if [[ $tagged != *" -i sh -c "* ]] || [[ $tagged != *" 3600" ]]; then
+    fail start_replaces "replacement didn't take --idle --timeout 1h: $tagged"
+    return
+  fi
+  pass start_replaces
 }
 
 # ---------------------------------------------------------------------------
@@ -137,7 +152,7 @@ test_start_idempotent() {
 # ---------------------------------------------------------------------------
 test_list_shows_instance() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip list_shows_instance "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    skip list_shows_instance "depends on test_start_replaces (caffeinate(1) exec blocked)"
     return
   fi
   local out
@@ -158,7 +173,7 @@ test_list_shows_instance() {
 # ---------------------------------------------------------------------------
 test_kill_mine() {
   if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
-    skip kill_mine "depends on test_start_idempotent (caffeinate(1) exec blocked)"
+    skip kill_mine "depends on test_start_replaces (caffeinate(1) exec blocked)"
     return
   fi
   local out tag
@@ -483,9 +498,161 @@ test_start_timeout_rejects_bad_durations() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 13: every command has its own --help
+# ---------------------------------------------------------------------------
+test_per_command_help() {
+  local sid="${TEST_TERM_SID}-help"
+  local cmd out via_help rc
+  for cmd in start list status kill-mine kill-orphans claude-pid; do
+    out=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" "$cmd" --help 2>&1)
+    rc=$?
+    if [ "$rc" != "0" ] || [[ $out != "Usage: claffeinate $cmd"* ]]; then
+      fail per_command_help "'$cmd --help': exit $rc, output: $out"
+      return
+    fi
+    via_help=$("${CLAFF[@]}" help "$cmd" 2>&1)
+    if [ "$via_help" != "$out" ]; then
+      fail per_command_help "'help $cmd' differs from '$cmd --help'"
+      return
+    fi
+    out=$(TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" "$cmd" --no-such-flag 2>&1)
+    rc=$?
+    if [ "$rc" != "2" ] || [[ $out != *"claffeinate $cmd --help"* ]]; then
+      fail per_command_help "'$cmd --no-such-flag': exit $rc, output: $out"
+      return
+    fi
+  done
+  if ls "${RUN_DIR}"*"${sid}"*.pid >/dev/null 2>&1; then
+    fail per_command_help "'start --help' started an instance"
+    return
+  fi
+  "${CLAFF[@]}" help no-such-command >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" != "2" ]; then
+    fail per_command_help "'help no-such-command': expected exit 2, got $rc"
+    return
+  fi
+  pass per_command_help
+}
+
+# ---------------------------------------------------------------------------
+# Test 14: concurrent starts in one tab leave exactly one instance
+# ---------------------------------------------------------------------------
+test_start_concurrent() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip start_concurrent "needs caffeinate(1) exec (build sandbox blocks it)"
+    return
+  fi
+  local sid="${TEST_TERM_SID}-concurrent"
+  local pids=() tagged
+  for _ in 1 2 3 4 5 6 7 8; do
+    TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+      "${CLAFF[@]}" start --idle >/dev/null 2>&1 &
+    pids+=("$!")
+  done
+  wait "${pids[@]}"
+  sleep 0.5
+  tagged=$(pgrep -a -f -- "caffeinate--claffeinate--tab-${sid}-" 2>/dev/null | wc -l | tr -d ' ')
+  TERM_SESSION_ID="$sid" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "${CLAFF[@]}" kill-mine >/dev/null 2>&1 || true
+  pkill -f -- "caffeinate--claffeinate--tab-${sid}-" 2>/dev/null || true
+  if [ "$tagged" != "1" ]; then
+    fail start_concurrent "8 concurrent starts left $tagged instances, expected 1"
+    return
+  fi
+  if ls "${RUN_DIR}"*"${sid}"*.lock >/dev/null 2>&1; then
+    fail start_concurrent "a lock was left behind"
+    return
+  fi
+  pass start_concurrent
+}
+
+# Runs the plugin's hook script for EVENT as the tab SID would.
+run_hook() {
+  TERM_SESSION_ID="$1" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    "$BASH" "${ROOT_DIR}/hooks/claffeinate-hook.sh" "$2" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Test 15: the plugin's hook events start, renew and stop the instance
+# ---------------------------------------------------------------------------
+test_hook_events() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip hook_events "needs caffeinate(1) exec (build sandbox blocks it)"
+    return
+  fi
+  local sid="${TEST_TERM_SID}-hook"
+  local pattern="caffeinate--claffeinate--tab-${sid}-${TEST_SSE_PORT}--"
+  local out tagged
+  out=$(run_hook "$sid" pre-tool)
+  sleep 0.3
+  tagged=$(pgrep -a -lf -- "$pattern" 2>/dev/null)
+  if [ -n "$out" ] || [[ $tagged != *" -i sh -c "* ]] || [[ $tagged != *" 7200" ]]; then
+    fail hook_events "pre-tool should start --idle for 2h, silently: output '$out', process: $tagged"
+    return
+  fi
+  out=$(run_hook "$sid" post-tool)
+  sleep 0.3
+  tagged=$(pgrep -a -lf -- "$pattern" 2>/dev/null)
+  if [ -n "$out" ] || [ "$(printf '%s\n' "$tagged" | grep -c .)" != "1" ] || [[ $tagged != *" 600" ]]; then
+    fail hook_events "post-tool should leave one 10m instance, silently: output '$out', process: $tagged"
+    return
+  fi
+  out=$(run_hook "$sid" session-end)
+  sleep 0.3
+  if [ -n "$out" ] || pgrep -q -f -- "$pattern" 2>/dev/null; then
+    fail hook_events "session-end should stop the instance, silently: output '$out'"
+    return
+  fi
+  if ! out=$(run_hook "$sid" no-such-event) || [ -n "$out" ]; then
+    fail hook_events "an unknown event should exit 0 silently: $out"
+    return
+  fi
+  pass hook_events
+}
+
+# ---------------------------------------------------------------------------
+# Test 16: the hook does nothing off macOS or without caffeinate(1)
+# ---------------------------------------------------------------------------
+test_hook_noop_without_caffeinate() {
+  local sid="${TEST_TERM_SID}-hooknoop"
+  local stubs out rc
+  stubs=$(mktemp -d)
+  # A PATH holding only a uname stub: first Darwin with no caffeinate, then
+  # Linux with a caffeinate that must never run.
+  printf '#!%s\necho Darwin\n' "$BASH" >"${stubs}/uname"
+  chmod +x "${stubs}/uname"
+  out=$(PATH="$stubs" run_hook "$sid" pre-tool)
+  rc=$?
+  if [ "$rc" != "0" ] || [ -n "$out" ]; then
+    rm -rf "$stubs"
+    fail hook_noop_without_caffeinate "no caffeinate: exit $rc, output: $out"
+    return
+  fi
+  printf '#!%s\necho Linux\n' "$BASH" >"${stubs}/uname"
+  printf '#!%s\n: >"%s/ran"\n' "$BASH" "$stubs" >"${stubs}/caffeinate"
+  chmod +x "${stubs}/caffeinate"
+  out=$(PATH="$stubs" run_hook "$sid" pre-tool)
+  rc=$?
+  if [ "$rc" != "0" ] || [ -n "$out" ] || [ -e "${stubs}/ran" ]; then
+    rm -rf "$stubs"
+    fail hook_noop_without_caffeinate "Linux: exit $rc, output: $out"
+    return
+  fi
+  rm -rf "$stubs"
+  if ls "${RUN_DIR}"*"${sid}"* >/dev/null 2>&1; then
+    fail hook_noop_without_caffeinate "left files in ${RUN_DIR}"
+    return
+  fi
+  pass hook_noop_without_caffeinate
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
-test_start_idempotent
+test_start_replaces
 test_list_shows_instance
 test_kill_mine
 test_kill_orphans_alive_noop
@@ -497,6 +664,10 @@ test_short_options
 test_kill_orphans_reaps_heartbeats
 test_start_timeout_expires
 test_start_timeout_rejects_bad_durations
+test_per_command_help
+test_start_concurrent
+test_hook_events
+test_hook_noop_without_caffeinate
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASSES" "$FAILS" "$SKIPS"
 [ "$FAILS" -eq 0 ]

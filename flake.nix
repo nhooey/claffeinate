@@ -97,7 +97,7 @@
                   nativeBuildInputs = [ pkgs.shellcheck ];
                 }
                 ''
-                  shellcheck ${./bin/claffeinate.sh} ${./tests/test.sh}
+                  shellcheck ${./bin/claffeinate.sh} ${./hooks/claffeinate-hook.sh} ${./tests/test.sh}
                   touch $out
                 '';
 
@@ -150,10 +150,11 @@
               {
                 category = "dev";
                 name = "lint";
-                help = "Run shellcheck on bin/claffeinate and tests/test.sh";
+                help = "Run shellcheck on the script, the plugin hook and the tests";
                 command = ''
                   set -eu
-                  shellcheck "$PRJ_ROOT/bin/claffeinate" "$PRJ_ROOT/tests/test.sh"
+                  shellcheck "$PRJ_ROOT/bin/claffeinate.sh" \
+                    "$PRJ_ROOT/hooks/claffeinate-hook.sh" "$PRJ_ROOT/tests/test.sh"
                 '';
               }
               {
