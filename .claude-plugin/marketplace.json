@@ -8,7 +8,7 @@
     {
       "name": "claffeinate",
       "source": "./",
-      "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes."
+      "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes. macOS only."
     }
   ]
 }

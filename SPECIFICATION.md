@@ -353,6 +353,19 @@ Ship as `tests/test.sh` invoking the script as a subprocess. Each test prints
     `uname` stub, `pre-tool` exits 0 silently and creates nothing, both when
     `uname` says `Darwin` and `caffeinate` is missing, and when `uname` says
     `Linux` and a `caffeinate` stub is present (the stub must not run).
+17. **prompt and stop renew for 10 minutes**: `prompt`, then `stop`, each
+    leave exactly one `-i` instance with a 600-second timeout, silently.
+18. **the hook runs from the project directory**: `pre-tool` run from
+    directory `a` with `CLAUDE_PROJECT_DIR` set to `project` tags the
+    instance `dir-project`, and `session-end` run from directory `c` with
+    the same `CLAUDE_PROJECT_DIR` stops it.
+19. **hooks.json is well formed**: every event is a known hook event, every
+    command is `bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh"
+    ACTION` for an action the hook script handles, and every timeout is at
+    least 15 seconds.
+20. **a clear error off macOS**: with a `uname` stub saying `Linux`, `start`
+    exits 1 printing `error: claffeinate needs macOS caffeinate(1)`, and
+    `start --help` still exits 0.
 
 ## Claude Code plugin
 
@@ -367,21 +380,31 @@ The repository is a Claude Code plugin, and its own marketplace:
   `bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" EVENT` with a
   15-second timeout (the start lock waits up to ~10 s).
 - `hooks/claffeinate-hook.sh EVENT`: maps the event to an action and runs
-  `bin/claffeinate.sh` beside it, with stdin, stdout and stderr detached.
+  `bin/claffeinate` beside it, with stdin, stdout and stderr detached. It
+  first changes to `$CLAUDE_PROJECT_DIR` (falling back to the current
+  directory), because the tag names the working directory and the agent may
+  have changed it since the session's last event.
+- `skills/status/SKILL.md`: `/claffeinate:status`, which only the user can
+  invoke. It runs `claffeinate status` and summarizes it.
+- `bin/` is on the agent's Bash `PATH` while the plugin is enabled, so the
+  agent runs `claffeinate` by name.
+- `version` in `plugin.json` is the single version. Installed copies update
+  only when it changes, and the Nix package reads it from there.
 
 | Hook event                          | EVENT         | Action                                 |
 | ----------------------------------- | ------------- | -------------------------------------- |
 | `UserPromptSubmit`                  | `prompt`      | `start --idle` (10m)                   |
 | `PreToolUse`                        | `pre-tool`    | `start --idle --timeout 2h`            |
 | `PostToolUse`, `PostToolUseFailure` | `post-tool`   | `start --idle` (10m)                   |
-| `Stop`                              | `stop`        | `start --idle` (10m)                   |
+| `Stop`, `StopFailure`               | `stop`        | `start --idle` (10m)                   |
 | `SessionEnd`                        | `session-end` | `kill-mine`                            |
 
 `PreToolUse` allows 2 hours because no hook fires during a tool call; the
 cap bounds how long a crashed tab can keep the Mac awake. `PostToolUse`,
 `PostToolUseFailure` and `Stop` bring the deadline back to 10 minutes, so a
 failed tool that skips `PostToolUse` is still covered at the end of the
-turn.
+turn. `StopFailure` fires instead of `Stop` when the turn ends on an API
+error, so it does the same.
 
 A hook's failure would show in the user's transcript on every tool call, so
 the hook script never fails: it always exits 0, prints nothing, and does
@@ -393,14 +416,15 @@ nothing unless `uname -s` is `Darwin` and `caffeinate` is on `PATH`.
   `pmset -g assertions` is the source of truth.)
 - Replacing `caffeinate` with direct `IOPMAssertion*` calls.
 - Any persistent daemon or background watcher.
-- Anything cross-platform.
+- Anything cross-platform. Off macOS, every command but help exits 1 with
+  `error: claffeinate needs macOS caffeinate(1)`.
 
 ## Deliverables
 
 - `bin/claffeinate` (executable, `#!/usr/bin/env bash`).
 - `tests/test.sh` (executable).
 - The plugin: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`,
-  `hooks/hooks.json` and `hooks/claffeinate-hook.sh`.
+  `hooks/hooks.json`, `hooks/claffeinate-hook.sh` and `skills/status/SKILL.md`.
 - `README.md` covering: install (symlink into `~/bin`), per-subcommand
   examples written exclusively with the canonical long option names, the
   IDE-vs-CLI SSE-port caveat, the `jq` dependency for `--json`, and how to add

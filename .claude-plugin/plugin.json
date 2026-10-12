@@ -1,11 +1,16 @@
 {
   "name": "claffeinate",
-  "version": "0.1.0",
-  "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes.",
+  "version": "0.2.0",
+  "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes. macOS only.",
   "author": {
     "name": "Neil Hooey"
   },
   "homepage": "https://github.com/nhooey/claffeinate",
   "repository": "https://github.com/nhooey/claffeinate",
-  "keywords": ["macos", "caffeinate", "sleep", "hooks"]
+  "keywords": [
+    "macos",
+    "caffeinate",
+    "sleep",
+    "hooks"
+  ]
 }
