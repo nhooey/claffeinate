@@ -49,7 +49,9 @@
       # claffeinate keeps its custom motd ("Type menu …"); the module's
       # generated banner is overridden by passing `motd` here.
       agent-skill-flake.devshellSkills = {
-        name = "claffeinate";
+        # Not "claffeinate": devshell names its launcher after this, and that
+        # launcher would shadow the installed command inside the dev shell.
+        name = "claffeinate-dev";
         motd = ''
           {bold}{14}claffeinate dev shell{reset}
           Type {bold}menu{reset} to see available commands.
@@ -61,15 +63,14 @@
         {
           packages.default = pkgs.stdenv.mkDerivation {
             pname = "claffeinate";
-            version = "0.1.0";
+            # The plugin manifest holds the one version for both.
+            inherit (lib.importJSON ./.claude-plugin/plugin.json) version;
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             dontBuild = true;
-            # Source is bin/claffeinate.sh; installs as bin/claffeinate so the
-            # `.sh` extension does not leak into the user-facing command name.
             installPhase = ''
               runHook preInstall
-              install -Dm755 bin/claffeinate.sh $out/bin/claffeinate
+              install -Dm755 bin/claffeinate $out/bin/claffeinate
               wrapProgram $out/bin/claffeinate \
                 --prefix PATH : ${lib.makeBinPath [ pkgs.jq ]}
               runHook postInstall
@@ -88,6 +89,8 @@
               enable = true;
               indent_size = 2;
             };
+            # shfmt matches by extension, and the script has none.
+            settings.formatter.shfmt.includes = [ "bin/claffeinate" ];
           };
 
           checks = {
@@ -97,7 +100,7 @@
                   nativeBuildInputs = [ pkgs.shellcheck ];
                 }
                 ''
-                  shellcheck ${./bin/claffeinate.sh} ${./hooks/claffeinate-hook.sh} ${./tests/test.sh}
+                  shellcheck ${./bin/claffeinate} ${./hooks/claffeinate-hook.sh} ${./tests/test.sh}
                   touch $out
                 '';
 
@@ -153,7 +156,7 @@
                 help = "Run shellcheck on the script, the plugin hook and the tests";
                 command = ''
                   set -eu
-                  shellcheck "$PRJ_ROOT/bin/claffeinate.sh" \
+                  shellcheck "$PRJ_ROOT/bin/claffeinate" \
                     "$PRJ_ROOT/hooks/claffeinate-hook.sh" "$PRJ_ROOT/tests/test.sh"
                 '';
               }
@@ -162,6 +165,12 @@
                 name = "test";
                 help = "Run the acceptance test suite";
                 command = ''exec "$PRJ_ROOT/tests/test.sh" "$@"'';
+              }
+              {
+                category = "dev";
+                name = "validate-plugin";
+                help = "Validate the plugin and marketplace manifests with Claude Code";
+                command = ''exec claude plugin validate --strict "$PRJ_ROOT"'';
               }
             ];
           };

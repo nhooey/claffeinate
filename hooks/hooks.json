@@ -56,6 +56,17 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh\" stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

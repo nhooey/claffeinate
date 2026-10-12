@@ -13,14 +13,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-# CLAFF is an array so we can invoke claffeinate.sh through `bash` rather
+# CLAFF is an array so we can invoke bin/claffeinate through `bash` rather
 # than relying on the kernel to exec the script directly. Some sandboxes
 # (sandboxed macOS Nix builds) block exec on the build volume even though
 # writes are fine; bash-as-loader bypasses that.
 if [ -n "${CLAFFEINATE_BIN:-}" ]; then
   CLAFF=("$CLAFFEINATE_BIN")
 else
-  CLAFF=(bash "${ROOT_DIR}/bin/claffeinate.sh")
+  CLAFF=(bash "${ROOT_DIR}/bin/claffeinate")
 fi
 
 # RUN_DIR mirrors the script's: defaults to /tmp/claffeinate/, but can be
@@ -569,9 +569,12 @@ test_start_concurrent() {
   pass start_concurrent
 }
 
-# Runs the plugin's hook script for EVENT as the tab SID would.
+# Runs the plugin's hook script for EVENT as the tab SID would. The hook
+# runs from $HOOK_PROJECT_DIR when set, and from the current directory
+# otherwise, whatever project the test suite itself runs under.
 run_hook() {
   TERM_SESSION_ID="$1" CLAUDE_CODE_SSE_PORT="$TEST_SSE_PORT" \
+    CLAUDE_PROJECT_DIR="${HOOK_PROJECT_DIR:-}" \
     "$BASH" "${ROOT_DIR}/hooks/claffeinate-hook.sh" "$2" 2>&1
 }
 
@@ -650,6 +653,123 @@ test_hook_noop_without_caffeinate() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 17: prompt and stop leave one silent 10m --idle instance
+# ---------------------------------------------------------------------------
+test_hook_prompt_and_stop() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip hook_prompt_and_stop "needs caffeinate(1) exec (build sandbox blocks it)"
+    return
+  fi
+  local sid="${TEST_TERM_SID}-hookps"
+  local pattern="caffeinate--claffeinate--tab-${sid}-${TEST_SSE_PORT}--"
+  local event out tagged
+  for event in prompt stop; do
+    out=$(run_hook "$sid" "$event")
+    sleep 0.3
+    tagged=$(pgrep -a -lf -- "$pattern" 2>/dev/null)
+    if [ -n "$out" ] || [ "$(printf '%s\n' "$tagged" | grep -c .)" != "1" ] ||
+      [[ $tagged != *" -i sh -c "* ]] || [[ $tagged != *" 600" ]]; then
+      run_hook "$sid" session-end >/dev/null
+      fail hook_prompt_and_stop "$event should leave one --idle 10m instance, silently: output '$out', process: $tagged"
+      return
+    fi
+  done
+  run_hook "$sid" session-end >/dev/null
+  pass hook_prompt_and_stop
+}
+
+# ---------------------------------------------------------------------------
+# Test 18: the hook tags from the project directory, not the current one
+# ---------------------------------------------------------------------------
+test_hook_pins_project_dir() {
+  if [ "$SYSTEM_EXEC_BLOCKED" = "1" ]; then
+    skip hook_pins_project_dir "needs caffeinate(1) exec (build sandbox blocks it)"
+    return
+  fi
+  local sid="${TEST_TERM_SID}-hookdir"
+  local pattern="caffeinate--claffeinate--tab-${sid}-${TEST_SSE_PORT}--"
+  local base tagged
+  base=$(mktemp -d)
+  mkdir -p "${base}/a" "${base}/project" "${base}/c"
+  (cd "${base}/a" && HOOK_PROJECT_DIR="${base}/project" run_hook "$sid" pre-tool >/dev/null)
+  sleep 0.3
+  tagged=$(pgrep -a -lf -- "$pattern" 2>/dev/null)
+  (cd "${base}/c" && HOOK_PROJECT_DIR="${base}/project" run_hook "$sid" session-end >/dev/null)
+  sleep 0.3
+  if [[ $tagged != *"${pattern}dir-project "* ]]; then
+    pkill -f -- "$pattern" 2>/dev/null || true
+    rm -rf "$base"
+    fail hook_pins_project_dir "instance should be tagged with the project directory: $tagged"
+    return
+  fi
+  if pgrep -q -f -- "$pattern" 2>/dev/null; then
+    pkill -f -- "$pattern" 2>/dev/null || true
+    rm -rf "$base"
+    fail hook_pins_project_dir "session-end from another directory left the instance running"
+    return
+  fi
+  rm -rf "$base"
+  pass hook_pins_project_dir
+}
+
+# ---------------------------------------------------------------------------
+# Test 19: every hooks.json entry runs the hook with an action it handles
+# ---------------------------------------------------------------------------
+test_hooks_json_structure() {
+  local hooks_json="${ROOT_DIR}/hooks/hooks.json"
+  local hook_script="${ROOT_DIR}/hooks/claffeinate-hook.sh"
+  local known="UserPromptSubmit PreToolUse PostToolUse PostToolUseFailure Stop StopFailure SessionEnd"
+  # shellcheck disable=SC2016 # the literal text hooks.json holds
+  local prefix='bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" '
+  local event command timeout action
+  while IFS=$'\t' read -r event command timeout; do
+    if [[ " $known " != *" $event "* ]]; then
+      fail hooks_json_structure "unknown hook event: $event"
+      return
+    fi
+    if [[ $command != "$prefix"* ]]; then
+      fail hooks_json_structure "$event runs an unexpected command: $command"
+      return
+    fi
+    action="${command#"$prefix"}"
+    if ! grep -Eq "^  ([a-z-]+ \| )*${action}( \| [a-z-]+)*\)" "$hook_script"; then
+      fail hooks_json_structure "$event uses action '$action', which the hook does not handle"
+      return
+    fi
+    # Must outlast start's wait for the per-tab lock, about 10 seconds.
+    if [ "$timeout" -lt 15 ]; then
+      fail hooks_json_structure "$event times out after ${timeout}s, under 15s"
+      return
+    fi
+  done < <(jq -r '.hooks | to_entries[] | .key as $e | .value[].hooks[] | [$e, .command, .timeout] | @tsv' "$hooks_json")
+  pass hooks_json_structure
+}
+
+# ---------------------------------------------------------------------------
+# Test 20: off macOS every command but help fails with a clear error
+# ---------------------------------------------------------------------------
+test_non_macos_error() {
+  local stubs out rc
+  stubs=$(mktemp -d)
+  printf '#!%s\necho Linux\n' "$BASH" >"${stubs}/uname"
+  chmod +x "${stubs}/uname"
+  out=$(PATH="${stubs}:$PATH" "$BASH" "${ROOT_DIR}/bin/claffeinate" start 2>&1)
+  rc=$?
+  if [ "$rc" != "1" ] || [ "$out" != "error: claffeinate needs macOS caffeinate(1)" ]; then
+    rm -rf "$stubs"
+    fail non_macos_error "start should exit 1 with the macOS error: exit $rc, output: $out"
+    return
+  fi
+  if ! PATH="${stubs}:$PATH" "$BASH" "${ROOT_DIR}/bin/claffeinate" start --help >/dev/null 2>&1; then
+    rm -rf "$stubs"
+    fail non_macos_error "start --help should still work"
+    return
+  fi
+  rm -rf "$stubs"
+  pass non_macos_error
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 test_start_replaces
@@ -668,6 +788,10 @@ test_per_command_help
 test_start_concurrent
 test_hook_events
 test_hook_noop_without_caffeinate
+test_hook_prompt_and_stop
+test_hook_pins_project_dir
+test_hooks_json_structure
+test_non_macos_error
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASSES" "$FAILS" "$SKIPS"
 [ "$FAILS" -eq 0 ]

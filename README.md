@@ -57,12 +57,16 @@ built-ins, apart from `jq` for `--json` output.
 
 ### 1. Install the Claude Code plugin
 
-In Claude Code:
+It needs macOS. In Claude Code:
 
 ```
 /plugin marketplace add nhooey/claffeinate
 /plugin install claffeinate@claffeinate
+/reload-plugins
 ```
+
+To check it worked, send any prompt, then run `/claffeinate:status`: this
+tab should have one `alive` instance.
 
 That's all it takes to keep the Mac awake while the agent works. The
 plugin's [hooks](https://code.claude.com/docs/en/hooks) run claffeinate at
@@ -80,8 +84,28 @@ build, and can sleep 10 minutes after it goes quiet. Each step takes about
 70 ms, so the agent doesn't slow down. On a machine without `caffeinate`,
 such as Linux, the hooks do nothing.
 
-The plugin also puts `claffeinate.sh` on the agent's `PATH`, so you can
-ask Claude which instances are running, or to stop one.
+The plugin also puts `claffeinate` on the agent's `PATH`, so you can ask
+Claude which instances are running, or to stop one. `/claffeinate:status`
+asks it for this tab's state.
+
+**Updating.** Third-party marketplaces don't update by themselves unless
+you turn that on under `/plugin` → Marketplaces. To update by hand:
+
+```
+/plugin marketplace update claffeinate
+/plugin update claffeinate@claffeinate
+/reload-plugins
+```
+
+**Uninstalling.** Run `/plugin uninstall claffeinate@claffeinate`. Any
+instance still running expires within 10 minutes, or stop it now with
+`claffeinate kill-mine`.
+
+**Coming from manual hooks or a keep-awake skill.** Remove them first.
+Claude Code runs a plugin's hooks and your own side by side, so hooks in
+`~/.claude/settings.json` that call `claffeinate-hook.sh` would run every
+step twice. A skill or `CLAUDE.md` rule that runs `claffeinate start` on
+each turn would swap the plugin's instance for its own.
 
 ### 2. Install the command, for your terminal
 
@@ -96,10 +120,10 @@ nix run github:nhooey/claffeinate -- --help     # try it once
 The Nix package puts `jq` on `claffeinate`'s `PATH`, so `--json` works with
 no separate install.
 
-From a checkout, link the script onto your `PATH` without its `.sh`:
+From a checkout, link the script onto your `PATH`:
 
 ```sh
-ln -s "$PWD/bin/claffeinate.sh" ~/bin/claffeinate
+ln -s "$PWD/bin/claffeinate" ~/bin/claffeinate
 ```
 
 ### 3. Reap what crashed tabs leave behind
@@ -208,7 +232,7 @@ The check looks at the `claude` process, not at who is listening on the SSE
 port. When Claude Code is connected to an IDE (JetBrains, VS Code), the IDE
 holds that port, so a port check would take the IDE for Claude Code. If the
 `claude` binary is ever renamed, change `CLAUDE_BIN_NAME` near the top of
-`bin/claffeinate.sh`.
+`bin/claffeinate`.
 
 ### The heartbeat
 
@@ -233,7 +257,7 @@ arrive together, the tab ends up with exactly one instance.
 ### Without the plugin
 
 The plugin is a set of hooks around `hooks/claffeinate-hook.sh`. To wire it
-up by hand instead, point your own hooks in `~/.claude/settings.json` at a
+up by hand instead of installing the plugin, never as well as it, point your own hooks in `~/.claude/settings.json` at a
 checkout, with the event names from `hooks/hooks.json`:
 
 ```json
@@ -247,7 +271,8 @@ checkout, with the event names from `hooks/hooks.json`:
 ```
 
 The script takes `prompt`, `pre-tool`, `post-tool`, `stop` and
-`session-end`. It never fails and never prints, so it can't interrupt the
+`session-end`. It runs from `$CLAUDE_PROJECT_DIR`, so the agent changing
+directory doesn't change which instance a step renews. It never fails and never prints, so it can't interrupt the
 agent.
 
 ## Limits
@@ -283,9 +308,16 @@ agent.
 ```sh
 tests/test.sh                          # acceptance tests
 nix flake check                        # shellcheck and the tests
-claude plugin validate .               # the plugin and marketplace manifests
+claude plugin validate --strict .      # the manifests (validate-plugin in the dev shell)
 claude --plugin-dir . -p "…"           # try the plugin from this checkout
 ```
+
+`--plugin-dir` takes over from an installed copy of the same plugin for
+that session.
+
+To release, raise `version` in `.claude-plugin/plugin.json`. Installed
+copies only update when it changes, and the Nix package reads its version
+from there too.
 
 The tests use made-up tab IDs, so they don't touch your real instances. Two
 of them need a live Claude Code tab connected to an IDE, and skip without
