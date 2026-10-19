@@ -3,6 +3,34 @@
 **Keep your Mac awake while Claude Code works, and let it sleep the moment
 the work stops, even when a tab crashes.**
 
+> [!IMPORTANT]
+> **This repository is archived: you probably don't need it.** Claude Code
+> now keeps the Mac awake by itself. Version 2.1.302 runs
+> `caffeinate -i -t 300` while a session is busy, renews it every 4
+> minutes, and lets go 30 seconds after the session stops being busy. A
+> session is busy while a turn runs, or a background subagent, workflow or
+> teammate does. Its `caffeinate` expires within 5 minutes if `claude`
+> crashes, so nothing is left behind.
+>
+> What Claude Code's own hold doesn't do:
+>
+> - **Background shells that outlive their turn.** Once a turn ends and
+>   only a `run_in_background` shell is left, Claude Code lets go, and the
+>   Mac can sleep mid-build. claffeinate's `shell` holds cover this; so does
+>   starting the command with `caffeinate -i`, or, on AC power,
+>   `sudo pmset -c sleep 0`.
+> - **Permission prompts and questions.** Claude Code lets go while one
+>   waits on you, so the Mac can sleep before you've answered. That's
+>   probably what you want; claffeinate's `turn` hold stays on through it.
+> - **A cap and a battery floor.** A busy session keeps the Mac awake for
+>   as long as it runs, at any battery level. claffeinate can't add either:
+>   its limits only end its own holds.
+> - **Saying why the Mac is awake.** `claffeinate status` names every
+>   hold and forecasts when the Mac will sleep. `pmset -g assertions`
+>   lists Claude Code's `caffeinate` too, but not which session it's for.
+>
+> The rest of this README describes 0.3.0 as it was when it was archived.
+
 ## The problem
 
 You give Claude Code a long task and step away. A few minutes later macOS
