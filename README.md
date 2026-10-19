@@ -1,7 +1,7 @@
 # claffeinate
 
-**Keep your Mac awake while Claude Code works, and let it sleep once the
-work stops, even when a tab crashes.**
+**Keep your Mac awake while Claude Code works, and let it sleep the moment
+the work stops, even when a tab crashes.**
 
 ## The problem
 
@@ -11,47 +11,58 @@ mid-task, its network connections drop, and you come back to half-finished
 work.
 
 [`caffeinate(1)`][caffeinate-man], the macOS utility that keeps a Mac awake,
-fixes that. But once you run Claude Code in more than one tab, it causes
-problems of its own:
+fixes that. But it doesn't know when the work is done:
 
+- **It stays on too long.** A `caffeinate` started for a task keeps the Mac
+  awake for a fixed time, or until someone stops it, long after the agent
+  has answered.
 - **Nothing says whose it is.** `ps` shows five `caffeinate` processes, and
-  none of them says which tab started it.
-- **It outlives its tab.** When a tab closes or crashes, its `caffeinate`
-  keeps running, and the Mac stays awake until you notice. With the lid open
-  on battery, that can mean a flat battery by morning.
-- **The blunt fix breaks other tabs.** `killall caffeinate` stops the
-  forgotten ones, and also the ones your other tabs are still using.
+  none of them says which session, or which part of its work, started it.
+- **It outlives its session.** When a tab closes or crashes, its
+  `caffeinate` keeps running. With the lid open on battery, that can mean a
+  flat battery by morning.
 
 ## What claffeinate does
 
-claffeinate starts `caffeinate` on behalf of one Claude Code tab and names
-the process after that tab. Every instance then answers two questions:
-*which tab owns me?* and *is that tab still open?* That lets claffeinate
-stop exactly the instances whose tab is gone, and leave the rest alone.
+claffeinate keeps the Mac awake only while something is working, through
+**holds**. Each hold is for one thing:
 
-Each instance lasts 10 minutes, and each `start` replaces the tab's
-instance with a fresh one. So when Claude Code runs `start` every time it
-does something, the Mac stays awake while the agent works, and sleeps
-normally once it has been quiet for 10 minutes.
+| Holder     | Starts when                          | Ends when                  |
+| ---------- | ------------------------------------ | -------------------------- |
+| a turn     | you send a prompt                    | the agent's response is in |
+| a subagent | the agent starts one                 | the subagent finishes      |
+| a shell    | the agent starts a background `Bash` | the shell exits            |
 
-```sh
-claffeinate start          # keep the Mac awake for this tab, for 10 minutes
-claffeinate list           # every instance, and whether its tab is open
-claffeinate kill-orphans   # stop the ones whose tab has closed
+A Monitor never holds the Mac awake. Every hold also ends by itself:
+
+- when its `claude` process exits
+- after `awake-max-duration`, 4 hours by default
+- once the battery is down to `awake-min-battery`, 20% by default, on AC
+  power too, since a battery can drain while plugged in
+
+`claffeinate` is one command for the whole Mac. `status` shows every hold
+of every session, and when the Mac will be allowed to sleep:
+
 ```
+$ claffeinate status
+claffeinate  2026-10-16 15:30  macOS 15.6.1  power=battery  holds=2
+💤 sleep    19:18  +3h48m  by=time
+⏳ time     19:18  +3h48m  cap=4h
+🔋 battery  19:40  +4h10m  now=64% floor=20% rate=-11%/h
+💻 macos    15:35  +5m     input=15:29(-40s) display=5m sleep=1m other=-
 
-```
-$ claffeinate list
-41822  w0t1p0:9C1E…  63342  api-server   alive
-41907  w0t2p0:52AF…  63342  web-client   alive
-38114  w0t4p0:D0B3…  63342  migrations   dead
+PID    SESSION   NAME                    HOLDER                         CLAUDE  STATE     STARTED          ENDS
+31985  0f311c94  Claffeinate             💬 turn                        55504   🟢 alive  14:42    -48m    18:42  +3h12m  ⏳ time
+32456  0f311c94  Claffeinate             🐚 shell-bmnsyo3e4             55504   🟢 alive  15:18    -12m    19:18  +3h48m  ⏳ time
 
-$ claffeinate kill-orphans
-killed 38114 caffeinate--claffeinate--tab-w0t4p0:D0B3…-63342--dir-migrations
+STOPPED          SESSION   NAME                    HOLDER                         REASON            RAN
+14:02    -1h28m  0f311c94  Claffeinate             💬 turn                        ✅ ended          1h02m
+13:40    -1h50m  9a1e2b77  Converting project to…  🤖 subagent-a1ed03884b02ccded  🔋 battery        22m
 ```
 
 It is a single Bash script for macOS. It needs nothing beyond macOS
-built-ins, apart from `jq` for `--json` output.
+built-ins, apart from `jq` for `--json` output and for the plugin's
+subagent and shell holds; macOS 15 ships `jq`.
 
 ## Quick start
 
@@ -65,28 +76,28 @@ It needs macOS. In Claude Code:
 /reload-plugins
 ```
 
-To check it worked, send any prompt, then run `/claffeinate:status`: this
-tab should have one `alive` instance.
+To check it worked, run `/claffeinate:status`: this session's turn should
+have an `alive` hold, since running the command is itself a turn.
 
-That's all it takes to keep the Mac awake while the agent works. The
-plugin's [hooks](https://code.claude.com/docs/en/hooks) run claffeinate at
-each step of the agent's work:
+That's all it takes. The plugin's [hooks](https://code.claude.com/docs/en/hooks)
+start and stop the holds:
 
-| When                                  | claffeinate                                 |
-| ------------------------------------- | ------------------------------------------- |
-| You send a prompt                     | awake for the next 10 minutes               |
-| A tool call starts                    | awake until it ends, for up to 2 hours      |
-| A tool call ends, or the turn ends    | awake for the next 10 minutes               |
-| You exit Claude Code                  | stops this tab's instance                   |
+| Hook event                       | claffeinate                                         |
+| -------------------------------- | --------------------------------------------------- |
+| `UserPromptSubmit`               | `start --holder turn`                               |
+| `Stop`, `StopFailure`            | `stop --holder turn`                                |
+| `SubagentStart`                  | `start --holder subagent-<agent_id>`                |
+| `SubagentStop`                   | `stop --holder subagent-<agent_id>`                 |
+| `PostToolUse`, background `Bash` | `start --holder shell-<task_id> --wait-pid <shell>` |
+| `SessionEnd`                     | `kill-session`                                      |
 
-So the Mac stays awake while the agent works, including through a long
-build, and can sleep 10 minutes after it goes quiet. Each step takes about
-70 ms, so the agent doesn't slow down. On a machine without `caffeinate`,
-such as Linux, the hooks do nothing.
+No hook runs on an ordinary tool call, so tool calls cost nothing. On a
+machine without `caffeinate`, such as Linux, the hooks do nothing.
 
 The plugin also puts `claffeinate` on the agent's `PATH`, so you can ask
-Claude which instances are running, or to stop one. `/claffeinate:status`
-asks it for this tab's state.
+Claude about the holds. `/claffeinate:status` shows the status, and
+`/claffeinate:set awake-max-duration 8h` changes a setting for this session
+only.
 
 **Updating.** Third-party marketplaces don't update by themselves unless
 you turn that on under `/plugin` → Marketplaces. To update by hand:
@@ -97,19 +108,20 @@ you turn that on under `/plugin` → Marketplaces. To update by hand:
 /reload-plugins
 ```
 
-**Uninstalling.** Run `/plugin uninstall claffeinate@claffeinate`. Any
-instance still running expires within 10 minutes, or stop it now with
-`claffeinate kill-mine`.
+Run `/reload-plugins` in every open session: a session keeps the hooks it
+loaded until then. After updating from 0.2.0, `claffeinate kill-orphans`
+stops 0.2.0's instances.
+
+**Uninstalling.** Run `/plugin uninstall claffeinate@claffeinate`, then
+`claffeinate kill-session` in a session that still has holds.
 
 **Coming from manual hooks or a keep-awake skill.** Remove them first.
 Claude Code runs a plugin's hooks and your own side by side, so hooks in
-`~/.claude/settings.json` that call `claffeinate-hook.sh` would run every
-step twice. A skill or `CLAUDE.md` rule that runs `claffeinate start` on
-each turn would swap the plugin's instance for its own.
+`~/.claude/settings.json` that call `claffeinate-hook.sh` would run twice.
 
 ### 2. Install the command, for your terminal
 
-The plugin runs its own copy of the script. To use `list`, `status` and
+The plugin runs its own copy of the script. To use `status` and
 `kill-orphans` from your shell, install the command too. With Nix:
 
 ```sh
@@ -117,8 +129,8 @@ nix profile install github:nhooey/claffeinate   # persistent
 nix run github:nhooey/claffeinate -- --help     # try it once
 ```
 
-The Nix package puts `jq` on `claffeinate`'s `PATH`, so `--json` works with
-no separate install.
+The Nix package puts `jq` on `claffeinate`'s `PATH`. Keep the installed
+command at the plugin's version: both read and write the same holds.
 
 From a checkout, link the script onto your `PATH`:
 
@@ -126,14 +138,13 @@ From a checkout, link the script onto your `PATH`:
 ln -s "$PWD/bin/claffeinate" ~/bin/claffeinate
 ```
 
-### 3. Reap what crashed tabs leave behind
+### 3. Reap what bugs leave behind
 
-A tab that crashes, or a window closed without exiting, never runs its
-`SessionEnd` hook. Its instance still runs out by itself: 10 minutes after
-its last step, or up to 2 hours if it crashed during a tool call. To reap
-those sooner, run `kill-orphans` at shell startup, in the background so the
-shell isn't slowed down. This works in `~/.zshrc`, `~/.bashrc` or
-`~/.config/fish/config.fish`:
+Every hold ends by itself, and a hold whose `claude` crashed ends within a
+minute. `kill-orphans` is for what a bug leaves behind: a `caffeinate`
+without its watcher, or a watcher without its `caffeinate`. Run it at shell
+startup, in the background so the shell isn't slowed down. This works in
+`~/.zshrc`, `~/.bashrc` or `~/.config/fish/config.fish`:
 
 ```sh
 command -v claffeinate >/dev/null && claffeinate kill-orphans >/dev/null 2>&1 &
@@ -144,169 +155,224 @@ To see what it would stop first, run `claffeinate kill-orphans --dry-run`.
 ## Commands
 
 Every command has its own help: `claffeinate COMMAND --help`, or
-`claffeinate help COMMAND`.
+`claffeinate help COMMAND`. Any command takes `--no-emoji` or `--emoji`.
 
-| Command                        | What it does                                                            |
-| ------------------------------ | ----------------------------------------------------------------------- |
-| `start [flags]`                | Keep the Mac awake for this tab, for 10 minutes. Prints the PID.        |
-| `list [--json]`                | One row per instance: PID, tab, SSE port, directory, `alive` or `dead`. |
-| `status [--json]`              | `list`, plus the owning `claude` PID and uptime in seconds.             |
-| `kill-mine`                    | Stop this tab's instance. Exits 3 if it has none.                       |
-| `kill-orphans [--dry-run]`     | Stop every instance whose tab has closed.                               |
-| `claude-pid --term-session-id ID --sse-port PORT` | Print the `claude` PID behind a tab. Exits 1 if none. |
+| Command                                         | What it does                                                               |
+| ----------------------------------------------- | -------------------------------------------------------------------------- |
+| `start [--holder H] [--wait-pid PID] [options]` | Start a hold, and print its watcher's PID.                                 |
+| `stop [--holder H]`                             | End a hold, logged as `ended`. Exits 3 if there is none.                   |
+| `status [--explain] [--stops N] [--json]`       | When the Mac may sleep, every hold, and the last stops.                    |
+| `list [--json]`                                 | One tab-separated row per hold.                                            |
+| `kill-session`                                  | End every hold of the session, logged as `killed`. Exits 3 if it has none. |
+| `kill-orphans [--dry-run]`                      | End what nothing else will end.                                            |
+| `config`, `config set`, `config unset`          | Show or change the settings.                                               |
+
+`start`, `stop` and `kill-session` act on `$CLAUDE_CODE_SESSION_ID`'s session,
+or `--session ID`; outside Claude Code the session is `none`. `start` takes
+the claude process from `$CLAUDE_PID`, or `--claude-pid`.
 
 ### `start`
 
-With no flags, `start` keeps the display from sleeping for 10 minutes. A
-tab has one instance: running `start` again replaces it, with the new flags
-and a fresh timeout. The flags map to `caffeinate`'s own, and combine
-freely:
+A holder has one hold: `start` for a holder that already has one prints
+that hold's PID and does nothing else. The holder is `turn`,
+`subagent-<id>`, `shell-<id>`, or `manual`, the default, for holds you start
+by hand. A hold keeps the Mac from sleeping while you're away; the display
+still turns off, unless you pass `--keep-display-on`.
 
-| Flag                 | Keeps…                                 | `caffeinate` |
-| -------------------- | -------------------------------------- | ------------ |
-| `--display`          | the display on (the default)           | `-d`         |
-| `--idle`             | the system from idle sleep; the display may still turn off | `-i` |
-| `--disk`             | the disk from idle sleep               | `-m`         |
-| `--system`           | the system awake, on AC power only     | `-s`         |
-| `--user`             | the user marked as active              | `-u`         |
-| `--timeout DURATION` | it running for DURATION, not 10m       |              |
+| Option                          | Effect                                 |
+| ------------------------------- | -------------------------------------- |
+| `--wait-pid PID`                | ends the hold once PID exits           |
+| `--awake-max-duration DURATION` | ends it after DURATION                 |
+| `--awake-min-battery PERCENT`   | ends it once the battery is at PERCENT |
+| `--keep-display-on`             | keeps the display on too               |
 
 DURATION is a number with units, largest first: `30s`, `45m`, `1h30m`, `2d`.
-A bare number is seconds.
+A bare number is seconds. `--timeout` is now `--awake-max-duration`.
 
 ```sh
-claffeinate start --idle                 # screen can dim; the work goes on
-claffeinate start --idle --timeout 2h    # the same, for two hours instead
+claffeinate start --keep-display-on --awake-max-duration 1h30m   # a presentation
+claffeinate stop                                                 # done early
+```
+
+### `status`
+
+`status` prints the same lines in the same order every time, with `-` for a
+value that doesn't apply, so your eye learns where each value sits and two
+readings show only what changed. Each moment is a clock time beside its
+signed distance from now: `+3h12m` ahead, `-40s` behind, `+0s` now. A plain
+length of time, such as `cap=4h` or `RAN`, never has a sign.
+
+The four forecast lines:
+
+| Line         | When                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| 💤 `sleep`   | the Mac is expected to sleep if you stay away; `by=` names the limit that decides it: `time`, `battery` or `macos` |
+| ⏳ `time`    | `awake-max-duration` ends the last hold                                                                            |
+| 🔋 `battery` | the battery reaches the lowest `awake-min-battery`, at its current drain; `none` on a Mac without one              |
+| 💻 `macos`   | macOS would sleep if the last hold ended now                                                                       |
+
+Each hold's `ENDS` is the earlier of its own two limits. It is an upper
+bound: a hold usually ends sooner, when its holder does. `NAME` is the
+session's name from its transcript: the last `/rename`, else the title
+Claude Code generated.
+
+`status --explain` adds the reasoning below, with this Mac's settings.
+`status --json` has the same fields, with every moment as an epoch.
+
+Emoji mark each line and state, always before the word, so `grep turn`
+still works. Each is one wide code point, drawn 2 columns wide in every
+terminal. `--no-emoji`, the `emoji = off` setting, or a locale that isn't
+UTF-8 turns them off; each column keeps its width, so nothing moves.
+
+### Settings
+
+| Setting              | Default | Variable                         |
+| -------------------- | ------- | -------------------------------- |
+| `awake-max-duration` | `4h`    | `CLAFFEINATE_AWAKE_MAX_DURATION` |
+| `awake-min-battery`  | `20`    | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
+| `emoji`              | `on`    | `CLAFFEINATE_EMOJI`              |
+
+The strongest layer wins:
+
+1. the flag: `--awake-max-duration`, `--awake-min-battery`, `--emoji`
+2. the session file, `~/.local/state/claffeinate/sessions/<session>.conf`,
+   which `/claffeinate:set` writes
+3. the variable, which Claude Code takes from the `env` of `--settings`,
+   then `.claude/settings.json`, then `~/.claude/settings.json`, then from
+   the environment it was started in
+4. the config file, `~/.config/claffeinate/config`
+5. the default
+
+Both files hold `setting = value` lines. A hold keeps the settings it
+started with; `claffeinate config` shows each value and its layer.
+
+```sh
+claffeinate config set --global awake-min-battery 30
 ```
 
 ### Scripting with `--json`
 
-`list` and `status` take `--json` and print an array of objects instead of
-rows. It needs `jq`; without it they exit 4 and print nothing on stdout.
+`list` and `status` take `--json`. It needs `jq`; without it they exit 4
+and print nothing on stdout.
 
 ```sh
-claffeinate status --json | jq '.[] | select(.alive) | {dir, uptime_seconds}'
+claffeinate list --json | jq '.[] | select(.alive | not)'
 ```
+
+## How macOS decides to sleep
+
+This Mac's power log, `pmset -g log`, on macOS 15.6.1, shows how a released
+hold turns into sleep:
+
+- **Releasing a hold restarts no timer.** A hold is a
+  `PreventUserIdleSystemSleep` assertion; ending it only stops preventing
+  sleep. macOS counts idle time from your last keyboard, mouse or trackpad
+  input the whole time.
+- **The display gates idle sleep.** While the display is on, powerd holds
+  "Prevent sleep while display is on". The display turns off once you've
+  been idle for `displaysleep` minutes of the current power source.
+- **Then the Mac sleeps,** once you've also been idle for the `sleep`
+  setting, unless another process holds an assertion: audio playing, a
+  call, or another `caffeinate`.
+
+So once the last hold ends, the Mac sleeps at the latest of: that moment,
+your last input plus `displaysleep`, and your last input plus `sleep`. If
+you've been away that long already, it sleeps within seconds. In the log: a
+hold released at 23:05:25 with the display already off was followed by
+sleep at 23:05:31; one released at 12:51:41 with the display on was
+followed by sleep at 12:52:40, 5 seconds after the display turned off.
+
+`status` reads these live: `pmset -g custom` for the settings,
+`ioreg -c IOHIDSystem`'s `HIDIdleTime` for your last input, and
+`pmset -g assertions` for other processes' assertions, named in `other=`.
+They sit in one function, `macos_sleep_model`, the only part a port to
+another OS would replace.
 
 ## How it works
 
-### Knowing the agent is working
+### Holds
 
-claffeinate doesn't watch the agent. It relies on two signals, and each one
-answers a different question:
-
-- **Is the agent busy? Ask the hooks.** Claude Code runs the plugin's hooks
-  when you send a prompt, around every tool call, and when a turn ends.
-  Each one runs `start`, which replaces the tab's instance and so resets
-  its deadline. While the agent is working, the deadline keeps moving. Once
-  it goes quiet, the deadline arrives and the instance exits. No hook fires
-  during a tool call, so the one before it allows up to 2 hours, and the
-  one after it brings the deadline back to 10 minutes.
-- **Is the tab still open? Ask the process table.** This decides what
-  `list` shows as `dead` and what `kill-orphans` stops. It says nothing
-  about whether the agent is busy: a tab left open at an idle prompt is
-  still `alive`.
-
-### Tagging
-
-`start` runs `caffeinate` with its process name (`argv[0]`) set to a tag
-that carries the tab's identity and the working directory's name:
+A hold is two processes, named with `exec -a` so `ps` shows what they're
+for:
 
 ```
-caffeinate--claffeinate--tab-<TERM_SESSION_ID>-<CLAUDE_CODE_SSE_PORT>--dir-<basename of $PWD>
+claffeinate-watch--<tag>            the watcher
+caffeinate--claffeinate--<tag>      caffeinate -i -w <PID>, its child
 ```
 
-The tag starts with `caffeinate--`, so `pgrep caffeinate` and
-`pgrep -f caffeinate` still find these processes. The tag is also kept as
-a symlink under `/tmp/claffeinate/symlinks/`, and the PID in
-`/tmp/claffeinate/<tag>.pid`.
+The tag carries everything about the hold, so the process table is the
+only registry:
 
-### Deciding a tab is gone
+```
+session-<id>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--at-<epoch>
+```
 
-An instance's tab is open if some running `claude` process has both its
-`TERM_SESSION_ID` and its `CLAUDE_CODE_SSE_PORT` in its environment. It's
-read with `ps -E`. Otherwise the instance is `dead`, and `kill-orphans`
-stops it.
+`caffeinate -w` waits on the claude process for a turn or a subagent, and
+on the shell for a background shell, so it ends the moment that process
+exits. The watcher waits on its `caffeinate` and wakes every minute to
+check the cap, the battery and the claude process. On `stop` it ends the
+hold as `ended`, and on `kill-session` or `kill-orphans` as `killed`.
 
-The check looks at the `claude` process, not at who is listening on the SSE
-port. When Claude Code is connected to an IDE (JetBrains, VS Code), the IDE
-holds that port, so a port check would take the IDE for Claude Code. If the
-`claude` binary is ever renamed, change `CLAUDE_BIN_NAME` near the top of
-`bin/claffeinate`.
+### The stop log
 
-### The heartbeat
+Each hold that stops writes one line to `~/Library/Logs/claffeinate.log`,
+where Console.app lists it under Log Reports:
 
-Each instance runs a small shell loop, which is the command `caffeinate`
-keeps awake for. Once a minute it writes `awake` to
-`/tmp/claffeinate/<tag>.log`. The loop is also what ends the instance:
+```
+2026-10-16T14:02:00+0700 session=0f311c94-… holder=turn reason=ended ran=1h02m start=… stop=…
+```
 
-- **The timeout:** it exits once the timeout passes, 10 minutes unless
-  `--timeout` says otherwise, and `caffeinate` exits with it.
-- **A killed `caffeinate`:** the loop notices and exits too, so no loop is
-  left running on its own.
+The reasons are `ended`, `claude-exited`, `cap`, `battery` and `killed`.
+The log keeps its last 1,000 lines once it passes 2,000. A link at
+`~/.local/state/claffeinate/claffeinate.log` points to it.
 
-`kill-orphans` also stops loops that lost their `caffeinate` before
-claffeinate handled that case.
+### Finding a background shell
 
-### Parallel tool calls
+A `PostToolUse` payload for a background `Bash` has its task id, but no
+PID. The shell is the child of `claude` whose standard output is
+`…/tasks/<task id>.output`; the hook finds it with `pgrep -P` and `lsof`.
 
-When the agent runs several tools at once, their hooks run `start` at the
-same moment. Starts in one tab take turns through a lock, so however many
-arrive together, the tab ends up with exactly one instance.
+### Parallel events
+
+Hooks can fire together. Starts for one holder take turns through a lock,
+so however many arrive together, the holder ends up with one hold.
 
 ### Without the plugin
 
 The plugin is a set of hooks around `hooks/claffeinate-hook.sh`. To wire it
-up by hand instead of installing the plugin, never as well as it, point your own hooks in `~/.claude/settings.json` at a
-checkout, with the event names from `hooks/hooks.json`:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "hooks": [{ "type": "command", "command": "bash ~/src/claffeinate/hooks/claffeinate-hook.sh pre-tool" }] }
-    ]
-  }
-}
-```
-
-The script takes `prompt`, `pre-tool`, `post-tool`, `stop` and
-`session-end`. It runs from `$CLAUDE_PROJECT_DIR`, so the agent changing
-directory doesn't change which instance a step renews. It never fails and never prints, so it can't interrupt the
-agent.
+up by hand instead of installing the plugin, never as well as it, copy the
+entries of `hooks/hooks.json` into `~/.claude/settings.json`, pointing at a
+checkout. The script reads the hook's JSON payload on stdin, takes
+`prompt`, `stop`, `subagent-start`, `subagent-stop`, `post-tool` and
+`session-end`, and never fails or prints, so it can't interrupt the agent.
 
 ## Limits
 
-- **A tool call gets up to 2 hours.** A single tool call that runs longer
-  can outlast its instance. With parallel tool calls, the first one to
-  finish brings the deadline back to 10 minutes while the others may still
-  be running.
-- **Outside an IDE, every instance looks orphaned.** Claude Code sets
-  `CLAUDE_CODE_SSE_PORT` only when it's connected to an IDE. Without it, an
-  instance is tagged `noport`, no `claude` process can match it, and
-  `kill-orphans` stops it even while its tab is working. If you run Claude
-  Code in a plain terminal, let the plugin's deadlines do the work, and
-  leave `kill-orphans` out of your shell startup.
-- **Terminals without `TERM_SESSION_ID`.** macOS Terminal, iTerm2 and
-  JetBrains terminals set it; most SSH sessions don't. There the tag says
-  `unknown`, and those instances are also treated as orphans.
-- **macOS only.** It wraps `caffeinate(1)` and uses BSD `ps -E` and `pgrep`.
-  It needs Bash 3.2 or later, which macOS ships.
+- **A turn waiting on you is still a turn.** While Claude Code waits for you
+  to approve a tool call, the Mac stays awake, up to the cap.
+- **Notifications are short turns.** A task notification, a Monitor event
+  or a subagent's report starts a turn of its own, and so a short hold.
+- **Undocumented fields.** The shell hold relies on `backgroundTaskId`, the
+  `tasks/<id>.output` path and `$CLAUDE_PID`, which Claude Code doesn't
+  document. If they change, background shells get no hold, and nothing else
+  breaks.
+- **macOS only.** It wraps `caffeinate(1)` and reads `pmset` and `ioreg`. It
+  needs Bash 3.2 or later, which macOS ships.
 
 ## Exit codes
 
-| Code | Meaning                                                  |
-| ---- | -------------------------------------------------------- |
-| 0    | Success                                                  |
-| 1    | Generic error                                            |
-| 2    | Misuse: unknown command or flag, missing argument        |
-| 3    | Nothing matched, such as `kill-mine` with no instance    |
-| 4    | `--json` requested, but `jq` is not installed            |
+| Code | Meaning                                       |
+| ---- | --------------------------------------------- |
+| 0    | Success                                       |
+| 1    | Generic error                                 |
+| 2    | Misuse: unknown command or flag, a bad value  |
+| 3    | Nothing matched, such as `stop` with no hold  |
+| 4    | `--json` requested, but `jq` is not installed |
 
 ## Development
 
 ```sh
-tests/test.sh                          # acceptance tests
+tests/test.sh [TEST...]                # acceptance tests, or only those named
 nix flake check                        # shellcheck and the tests
 claude plugin validate --strict .      # the manifests (validate-plugin in the dev shell)
 claude --plugin-dir . -p "…"           # try the plugin from this checkout
@@ -319,9 +385,9 @@ To release, raise `version` in `.claude-plugin/plugin.json`. Installed
 copies only update when it changes, and the Nix package reads its version
 from there too.
 
-The tests use made-up tab IDs, so they don't touch your real instances. Two
-of them need a live Claude Code tab connected to an IDE, and skip without
-one. [`SPECIFICATION.md`](SPECIFICATION.md) has the full contract: every
-function, behavior and test.
+The tests run in their own directories, with made-up sessions and stand-in
+claude processes, so they never touch your real holds; stubs for `ioreg`,
+`pmset` and `sw_vers` pin the battery and the macOS settings.
+[`SPECIFICATION.md`](SPECIFICATION.md) has the full contract.
 
 [caffeinate-man]: https://ss64.com/mac/caffeinate.html

@@ -1,5 +1,5 @@
 {
-  "description": "Keep the Mac awake while the agent works: every prompt and tool call pushes a 10-minute deadline back, and exiting the session stops it.",
+  "description": "Keep the Mac awake only while Claude Code works: during a turn, a subagent or a background shell, each up to a 4-hour cap and down to a 20% battery floor.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -12,12 +12,23 @@
         ]
       }
     ],
-    "PreToolUse": [
+    "SubagentStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh\" pre-tool",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh\" subagent-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh\" subagent-stop",
             "timeout": 15
           }
         ]
@@ -25,17 +36,7 @@
     ],
     "PostToolUse": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh\" post-tool",
-            "timeout": 15
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
