@@ -1,169 +1,73 @@
 #!/usr/bin/env bash
 #
-# claffeinate -- start/list/kill caffeinate instances tagged with the
-# Claude Code tab that owns them. macOS-only.
+# claffeinate -- keep a Mac awake only while Claude Code is working, and
+# show every hold on the Mac and when it will be allowed to sleep.
+# macOS-only.
 #
-# Each instance is launched via a uniquely-named symlink to caffeinate(1)
-# so the binary name in `ps` carries the tab identifier (TERM_SESSION_ID +
-# CLAUDE_CODE_SSE_PORT) and the basename of the working directory.
+# A hold is two processes, both named with `exec -a` so the process table
+# is the registry:
 #
-# Accepted behavior on TERM_SESSION_ID=unknown: SSH sessions and other
-# environments without iTerm/JediTerm leave TERM_SESSION_ID unset; we
-# substitute the literal "unknown". Any "unknown" instance can never be
-# matched to a live Claude tab, so kill-orphans treats it as an orphan
-# whenever no live claude process advertises the same combination -- which
-# is by definition always true. Such instances are killed aggressively.
+#   claffeinate-watch--<tag>     the watcher, which ends the hold on time
+#   caffeinate--claffeinate--<tag>  caffeinate(1), the watcher's child
 #
-# A note on pgrep -a: macOS BSD pgrep EXCLUDES ancestors of the calling
-# process by default. When this script is invoked from inside a Claude
-# Code session, the claude binary is an ancestor and would be missed by
-# `pgrep -x claude`. We pass -a everywhere so ancestors are included.
+# The tag carries everything about the hold:
+#
+#   session-<id>--holder-<holder>--claude-<pid>--max-<s>--floor-<pct>--at-<epoch>
+#
+# <holder> is `turn`, `subagent-<agent_id>`, `shell-<task_id>` or `manual`.
+# A hold ends when its holder stops it, when its claude process exits, after
+# max seconds, or once the battery is at floor percent; the watcher checks
+# every 60 seconds, and logs one line per hold that stops.
+#
+# Holds are found in one `ps -A` snapshot, which, unlike macOS pgrep without
+# -a, includes the caller's ancestors.
 
 set -euo pipefail
 
-readonly TAG_PREFIX="caffeinate--claffeinate--"
-# RUN_DIR is overridable via $CLAFFEINATE_RUN_DIR for tests and sandboxed CI
-# where /tmp/claffeinate/ may not be writable. Must end with "/".
-readonly RUN_DIR="${CLAFFEINATE_RUN_DIR:-/tmp/claffeinate/}"
-readonly TAG_DIR="${RUN_DIR}symlinks/"
-readonly CLAUDE_BIN_NAME="claude"
-# Matches the heartbeat `sh -c` that caffeinate(1) runs as its utility.
-# Anchored on `^sh -c` so the tagged caffeinate, whose argv also carries
-# the heartbeat text, never matches.
-readonly HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
-# How long `start` keeps the Mac awake when no --timeout is given. Each
-# `start` restarts the clock, so an agent that keeps calling it stays awake.
-readonly DEFAULT_TIMEOUT="10m"
+readonly CAFF_PREFIX="caffeinate--claffeinate--"
+# Matches a tagged caffeinate's argv[0]; 0.2.0's had a symlink directory
+# before the name.
+readonly CAFF_PATTERN="^(/[^ ]*/)?${CAFF_PREFIX}"
+readonly WATCH_PREFIX="claffeinate-watch--"
+# 0.2.0's instances and heartbeat loops, reaped by kill-orphans after an
+# upgrade.
+readonly LEGACY_HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
 
-# ---------- pure detection ----------
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+readonly SELF
+# Every path is overridable, for tests and sandboxed builds. RUN_DIR must
+# end with "/".
+readonly RUN_DIR="${CLAFFEINATE_RUN_DIR:-/tmp/claffeinate-${UID}/}"
+readonly STATE_DIR="${CLAFFEINATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claffeinate}"
+readonly CONFIG_FILE="${CLAFFEINATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claffeinate/config}"
+# In ~/Library/Logs, so Console.app lists it; Console.app doesn't follow a
+# symlink placed there, so the link goes the other way, from STATE_DIR.
+readonly LOG_FILE="${CLAFFEINATE_LOG:-$HOME/Library/Logs/claffeinate.log}"
+readonly CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+readonly WATCH_INTERVAL="${CLAFFEINATE_WATCH_INTERVAL:-60}"
+readonly LOG_MAX_LINES=2000
+readonly LOG_KEEP_LINES=1000
+readonly NAME_WIDTH=22
+# Room for "🤖 subagent-" and a 17-character agent id, as Claude Code
+# 2.1.296 makes them.
+readonly HOLDER_WIDTH=29
 
-claude_tab_id() {
-  local term_sid="${TERM_SESSION_ID:-unknown}"
-  local sse_port="${CLAUDE_CODE_SSE_PORT:-noport}"
-  printf '%s-%s\n' "$term_sid" "$sse_port"
+readonly SETTINGS="awake-max-duration awake-min-battery emoji"
+
+NOW=0
+DATE_STYLE=bsd
+EMOJI_FLAG=""
+EMOJI_ON=1
+
+# ---------- small helpers ----------
+
+die() {
+  printf 'error: %s\n' "$1" >&2
+  exit "${2:-1}"
 }
 
-current_tag() {
-  local term_sid="${TERM_SESSION_ID:-unknown}"
-  local sse_port="${CLAUDE_CODE_SSE_PORT:-noport}"
-  local dir
-  dir="$(basename "$PWD")"
-  printf '%stab-%s-%s--dir-%s\n' \
-    "$TAG_PREFIX" "$term_sid" "$sse_port" "$dir"
-}
-
-parse_tag() {
-  local tag="$1"
-  local rest="${tag#"${TAG_PREFIX}"tab-}"
-  local left="${rest%%--dir-*}"
-  local dir="${rest#*--dir-}"
-  local term_sid sse_port
-  if [[ $left =~ ^(.+)-([0-9]+|noport)$ ]]; then
-    term_sid="${BASH_REMATCH[1]}"
-    sse_port="${BASH_REMATCH[2]}"
-  else
-    sse_port="${left##*-}"
-    term_sid="${left%-*}"
-  fi
-  printf '%s %s %s\n' "$term_sid" "$sse_port" "$dir"
-}
-
-list_tagged_pids() {
-  pgrep -a -f -- "$TAG_PREFIX" 2>/dev/null || true
-}
-
-list_orphaned_heartbeat_pids() {
-  # caffeinate(1) forks: the original process execs the utility and the
-  # tagged caffeinate stays behind as its child. A heartbeat with no
-  # tagged child has lost its caffeinate and keeps nothing awake.
-  local pid
-  for pid in $(pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null); do
-    pgrep -q -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || printf '%s\n' "$pid"
-  done
-}
-
-stop_instance() {
-  # Stops the instance whose heartbeat is $1, along with the tagged
-  # caffeinate under it. Does nothing once $1 is no longer a heartbeat, so
-  # a stale pidfile whose PID has been reused can't stop anything else.
-  local pid="$1"
-  pgrep -a -f -- "$HEARTBEAT_PATTERN" 2>/dev/null | grep -qx -- "$pid" || return 0
-  pkill -P "$pid" -f -- "$TAG_PREFIX" 2>/dev/null || true
-  kill "$pid" 2>/dev/null || true
-}
-
-lock_tag() {
-  # Serializes `start` within one tab. The plugin's hooks fire together
-  # when the agent runs tools in parallel, and two starts left to race
-  # would each spawn an instance and lose track of one. The lock is a
-  # symlink whose target is the holder's PID, created atomically by
-  # `ln -s`, so there is never a lock without a holder; a lock whose holder
-  # has died is taken over. Gives up after about 10 seconds.
-  local lock="$1" holder tries=0
-  until ln -s "$$" "$lock" 2>/dev/null; do
-    holder=$(readlink "$lock" 2>/dev/null || true)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      rm -f "$lock"
-      continue
-    fi
-    tries=$((tries + 1))
-    [ "$tries" -lt 200 ] || return 1
-    sleep 0.05
-  done
-}
-
-unlock_tag() {
-  local lock="$1"
-  [ "$(readlink "$lock" 2>/dev/null || true)" = "$$" ] && rm -f "$lock"
-  return 0
-}
-
-tag_for_pid() {
-  # Returns the basename of argv[0] for $pid, but only when it begins with
-  # our TAG_PREFIX -- which is the only case any caller cares about. Uses
-  # `pgrep -alf` instead of `ps -p ... -o comm=` because /bin/ps is SUID
-  # root and is denied by the macOS Nix build sandbox; pgrep is allowed.
-  local pid="$1"
-  local line
-  line=$(pgrep -alf -- "$TAG_PREFIX" 2>/dev/null | awk -v p="$pid" '
-    $1 == p {
-      sub(/^[0-9]+[[:space:]]+/, "")
-      print
-      exit
-    }
-  ')
-  [ -z "$line" ] && return 0
-  local exe="${line%% *}"
-  basename "$exe"
-}
-
-ps_env() {
-  local pid="$1"
-  ps -E -p "$pid" -o command= 2>/dev/null || true
-}
-
-claude_pid_for() {
-  local term_sid="$1"
-  local sse_port="$2"
-  local pids
-  pids=$(pgrep -a -x "$CLAUDE_BIN_NAME" 2>/dev/null) || return 1
-  local pid env_line
-  for pid in $pids; do
-    env_line=$(ps_env "$pid")
-    [ -z "$env_line" ] && continue
-    if printf '%s\n' "$env_line" | tr ' ' '\n' |
-      grep -qx "TERM_SESSION_ID=$term_sid" &&
-      printf '%s\n' "$env_line" | tr ' ' '\n' |
-      grep -qx "CLAUDE_CODE_SSE_PORT=$sse_port"; then
-      printf '%s\n' "$pid"
-      return 0
-    fi
-  done
-  return 1
-}
-
-tab_is_alive() {
-  claude_pid_for "$@" >/dev/null
+warn() {
+  printf 'warning: %s\n' "$1" >&2
 }
 
 require_jq() {
@@ -173,31 +77,37 @@ require_jq() {
   fi
 }
 
-# ---------- helpers ----------
-
-etime_to_seconds() {
-  local etime="$1"
-  local days=0 rest="$etime"
-  if [[ $rest == *-* ]]; then
-    days="${rest%%-*}"
-    rest="${rest#*-}"
-  fi
-  local hours=0 mins=0 secs=0
-  local IFS=:
-  # shellcheck disable=SC2086
-  set -- $rest
-  if [ $# -eq 3 ]; then
-    hours=$1
-    mins=$2
-    secs=$3
-  elif [ $# -eq 2 ]; then
-    mins=$1
-    secs=$2
-  elif [ $# -eq 1 ]; then
-    secs=$1
-  fi
-  printf '%d\n' "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
+# Reports a flag the command doesn't accept, and where its flags are listed.
+unknown_flag() {
+  printf "error: unknown flag for %s: %s (see 'claffeinate %s --help')\n" \
+    "$1" "$2" "$1" >&2
+  return 2
 }
+
+need_value() {
+  [ "$2" -ge 2 ] || die "$1 requires a value" 2
+}
+
+# The one source of "now", so a test can pin it with CLAFFEINATE_NOW.
+now_epoch() {
+  if [ -n "${CLAFFEINATE_NOW:-}" ]; then
+    printf '%s\n' "$CLAFFEINATE_NOW"
+  else
+    date +%s
+  fi
+}
+
+# Formats epoch $1 with strftime format $2, with BSD or GNU date(1),
+# whichever is first on PATH.
+date_fmt() {
+  if [ "$DATE_STYLE" = gnu ]; then
+    date -d "@$1" "+$2"
+  else
+    date -r "$1" "+$2"
+  fi
+}
+
+# ---------- durations and moments ----------
 
 duration_to_seconds() {
   # Accepts a bare number of seconds or one or more <number><unit> parts in
@@ -219,28 +129,511 @@ duration_to_seconds() {
   printf '%d\n' "$total"
 }
 
+# A length of time, never signed: 40s, 5m, 1h02m, 4h, 2d03h.
+fmt_duration() {
+  local s="$1"
+  if [ "$s" -lt 60 ]; then
+    printf '%ds\n' "$s"
+  elif [ "$s" -lt 3600 ]; then
+    printf '%dm\n' "$((s / 60))"
+  elif [ "$s" -lt 86400 ]; then
+    if [ $((s % 3600 / 60)) -eq 0 ]; then
+      printf '%dh\n' "$((s / 3600))"
+    else
+      printf '%dh%02dm\n' "$((s / 3600))" "$((s % 3600 / 60))"
+    fi
+  elif [ $((s % 86400 / 3600)) -eq 0 ]; then
+    printf '%dd\n' "$((s / 86400))"
+  else
+    printf '%dd%02dh\n' "$((s / 86400))" "$((s % 86400 / 3600))"
+  fi
+}
+
+# A moment's distance from now, always signed: +3h12m, -40s, +0s.
+fmt_rel() {
+  local d=$(($1 - NOW))
+  if [ "$d" -lt 0 ]; then
+    printf -- '-%s\n' "$(fmt_duration $((-d)))"
+  else
+    printf '+%s\n' "$(fmt_duration "$d")"
+  fi
+}
+
+# A moment's clock time, HH:MM, with the date added when it isn't today.
+fmt_clock() {
+  if [ "$(date_fmt "$1" %Y-%m-%d)" = "$(date_fmt "$NOW" %Y-%m-%d)" ]; then
+    date_fmt "$1" %H:%M
+  else
+    date_fmt "$1" '%m-%d %H:%M'
+  fi
+}
+
+# A moment inside a key=value detail: 15:29(-40s).
+fmt_moment() {
+  printf '%s(%s)\n' "$(fmt_clock "$1")" "$(fmt_rel "$1")"
+}
+
+# ---------- emoji ----------
+
+# Every emoji the output uses. Each is one code point with
+# Emoji_Presentation=Yes and East_Asian_Width=W, so every terminal draws it
+# 2 columns wide; tests/test.sh checks each entry.
+emoji_for() {
+  case "$1" in
+  sleep) printf '💤' ;;
+  time | cap) printf '⏳' ;;
+  battery) printf '🔋' ;;
+  macos) printf '💻' ;;
+  alive) printf '🟢' ;;
+  dead) printf '🔴' ;;
+  turn) printf '💬' ;;
+  subagent) printf '🤖' ;;
+  shell) printf '🐚' ;;
+  manual) printf '✋' ;;
+  ended) printf '✅' ;;
+  claude-exited) printf '🚪' ;;
+  killed) printf '🧹' ;;
+  *) printf '' ;;
+  esac
+}
+
+# A table cell marked with the emoji for key $1, before text $2. The
+# renderer draws the emoji or leaves its 3 columns blank.
+marked() {
+  printf '\001%s\001%s\n' "$(emoji_for "$1")" "$2"
+}
+
+holder_kind() {
+  case "$1" in
+  subagent-*) printf 'subagent\n' ;;
+  shell-*) printf 'shell\n' ;;
+  *) printf '%s\n' "$1" ;;
+  esac
+}
+
+utf8_locale() {
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8* | *utf-8* | *UTF8* | *utf8*) return 0 ;;
+  esac
+  return 1
+}
+
+# ---------- tables ----------
+
+T_ROWS=()
+T_MIN=()
+T_NONE=0
+
+# Starts a table whose columns are at least the widths given, so its shape
+# stays the same from one reading to the next.
+table_reset() {
+  T_ROWS=()
+  T_MIN=("$@")
+  T_NONE=0
+}
+
+# Marks the table empty: "(none)" prints under the header, and takes no
+# part in the widths.
+table_none() {
+  T_NONE=1
+}
+
+# Adds one row; each argument is a cell. Cells are joined with the unit
+# separator, which unlike a tab keeps an empty cell when read back.
+table_row() {
+  local IFS=$'\037'
+  T_ROWS+=("$*")
+}
+
+# Width of a cell as drawn with emoji, so a column keeps its width with
+# them off.
+cell_width() {
+  local c="$1"
+  if [ "${c:0:1}" = $'\001' ]; then
+    c="${c#$'\001'}"
+    c="${c#*$'\001'}"
+    printf '%d\n' "$((${#c} + 3))"
+  else
+    printf '%d\n' "${#c}"
+  fi
+}
+
+# Prints the rows, each column padded to its widest cell, 2 spaces apart.
+table_print() {
+  local widths=() row cells i w c text pad out
+  [ "${#T_ROWS[@]}" -gt 0 ] || return 0
+  widths=(${T_MIN[@]+"${T_MIN[@]}"})
+  for row in "${T_ROWS[@]}"; do
+    IFS=$'\037' read -r -a cells <<<"$row"
+    for ((i = 0; i < ${#cells[@]}; i++)); do
+      w=$(cell_width "${cells[$i]}")
+      if [ "$i" -ge "${#widths[@]}" ] || [ "$w" -gt "${widths[$i]}" ]; then
+        widths[i]=$w
+      fi
+    done
+  done
+  for row in "${T_ROWS[@]}"; do
+    IFS=$'\037' read -r -a cells <<<"$row"
+    out=""
+    for ((i = 0; i < ${#cells[@]}; i++)); do
+      c="${cells[$i]}"
+      w=$(cell_width "$c")
+      if [ "${c:0:1}" = $'\001' ]; then
+        c="${c#$'\001'}"
+        text="${c#*$'\001'}"
+        if [ "$EMOJI_ON" = 1 ]; then
+          c="${c%%$'\001'*} $text"
+          w=$((${#text} + 3))
+        else
+          c="$text"
+          w=${#text}
+        fi
+      else
+        w=${#c}
+      fi
+      if [ "$i" -lt $((${#cells[@]} - 1)) ]; then
+        printf -v pad '%*s' $((widths[i] - w + 2)) ''
+        out+="$c$pad"
+      else
+        out+="$c"
+      fi
+    done
+    printf '%s\n' "${out%"${out##*[! ]}"}"
+  done
+  [ "$T_NONE" = 0 ] || printf '(none)\n'
+}
+
+# ---------- settings ----------
+
+setting_env_name() {
+  local n="$1"
+  n=$(printf '%s' "$n" | tr 'a-z-' 'A-Z_')
+  printf 'CLAFFEINATE_%s\n' "$n"
+}
+
+setting_default() {
+  case "$1" in
+  awake-max-duration) printf '4h\n' ;;
+  awake-min-battery) printf '20\n' ;;
+  emoji) printf 'on\n' ;;
+  esac
+}
+
+# Prints the setting's value in its working form: seconds, a percent, or
+# on/off. Fails on a value the setting can't take.
+setting_normalize() {
+  case "$1" in
+  awake-max-duration) duration_to_seconds "$2" ;;
+  awake-min-battery)
+    [[ $2 =~ ^[0-9]+$ ]] && [ "$((10#$2))" -le 100 ] || return 1
+    printf '%d\n' "$((10#$2))"
+    ;;
+  emoji)
+    case "$2" in
+    on | yes | true | 1) printf 'on\n' ;;
+    off | no | false | 0) printf 'off\n' ;;
+    *) return 1 ;;
+    esac
+    ;;
+  *) return 1 ;;
+  esac
+}
+
+is_setting() {
+  case " $SETTINGS " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+# Reads `setting = value` lines; the last one wins. Never sourced.
+conf_get() {
+  [ -f "$1" ] || return 1
+  local v
+  v=$(awk -v k="$2" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      eq = index(line, "=")
+      if (!eq) next
+      key = substr(line, 1, eq - 1); val = substr(line, eq + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      if (key == k) { found = 1; out = val }
+    }
+    END { if (found) print out; else exit 1 }
+  ' "$1") || return 1
+  printf '%s\n' "$v"
+}
+
+conf_set() {
+  local file="$1" key="$2" value="$3" tmp
+  mkdir -p "$(dirname "$file")"
+  tmp="${file}.tmp.$$"
+  {
+    [ -f "$file" ] && awk -v k="$key" '
+      { line = $0; eq = index(line, "="); key = substr(line, 1, eq - 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        if (eq && key == k) next; print }
+    ' "$file"
+    if [ -n "$value" ]; then printf '%s = %s\n' "$key" "$value"; fi
+  } >"$tmp"
+  mv "$tmp" "$file"
+}
+
+session_conf() {
+  printf '%s/sessions/%s.conf\n' "$STATE_DIR" "$1"
+}
+
+# Resolves setting $1, strongest layer first: the flag $2, the session
+# file of session $3, the variable, the config file, the default. Sets
+# R_VALUE (normalized), R_RAW and R_SOURCE. A layer holding a bad value is
+# warned about and skipped, so a typo never leaves the Mac without a limit.
+resolve_setting() {
+  local name="$1" flag="${2:-}" sid="${3:-}" raw var
+  R_VALUE="" R_RAW="" R_SOURCE=""
+  if [ -n "$flag" ]; then
+    R_RAW="$flag" R_SOURCE="flag"
+    R_VALUE=$(setting_normalize "$name" "$flag") || die "--$name: bad value: $flag" 2
+    return 0
+  fi
+  if [ -n "$sid" ] && raw=$(conf_get "$(session_conf "$sid")" "$name"); then
+    if R_VALUE=$(setting_normalize "$name" "$raw"); then
+      R_RAW="$raw" R_SOURCE="session"
+      return 0
+    fi
+    warn "$name: bad value '$raw' in $(session_conf "$sid"); ignored"
+  fi
+  var=$(setting_env_name "$name")
+  raw="${!var:-}"
+  if [ -n "$raw" ]; then
+    if R_VALUE=$(setting_normalize "$name" "$raw"); then
+      R_RAW="$raw" R_SOURCE="env"
+      return 0
+    fi
+    warn "$name: bad value '$raw' in \$$var; ignored"
+  fi
+  if raw=$(conf_get "$CONFIG_FILE" "$name"); then
+    if R_VALUE=$(setting_normalize "$name" "$raw"); then
+      R_RAW="$raw" R_SOURCE="config"
+      return 0
+    fi
+    warn "$name: bad value '$raw' in $CONFIG_FILE; ignored"
+  fi
+  R_RAW=$(setting_default "$name")
+  R_VALUE=$(setting_normalize "$name" "$R_RAW")
+  R_SOURCE="default"
+}
+
+# Decides EMOJI_ON from --emoji/--no-emoji, the emoji setting and the
+# locale.
+resolve_emoji() {
+  if [ -n "$EMOJI_FLAG" ]; then
+    resolve_setting emoji "$EMOJI_FLAG" ""
+  else
+    resolve_setting emoji "" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null
+  fi
+  EMOJI_ON=0
+  if [ "$R_VALUE" = on ] && utf8_locale; then
+    EMOJI_ON=1
+  fi
+}
+
+# ---------- the tag ----------
+
+valid_word() {
+  [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] && [[ $1 != *--* ]]
+}
+
+# Splits a tag into P_SID, P_HOLDER, P_CLAUDE, P_MAX, P_FLOOR, P_AT.
+parse_tag() {
+  local re='^session-(.+)--holder-(.+)--claude-([0-9]+)--max-([0-9]+)--floor-([0-9]+)--at-([0-9]+)$'
+  [[ $1 =~ $re ]] || return 1
+  P_SID="${BASH_REMATCH[1]}" P_HOLDER="${BASH_REMATCH[2]}"
+  P_CLAUDE="${BASH_REMATCH[3]}" P_MAX="${BASH_REMATCH[4]}"
+  P_FLOOR="${BASH_REMATCH[5]}" P_AT="${BASH_REMATCH[6]}"
+}
+
+# The process table, read once per command by load_procs: "PID PPID
+# ARGV...". Read with ps rather than pgrep, so that a watcher's own forks,
+# which carry its argv until they exec, can be told apart by their parent.
+PROCS=""
+
+load_procs() {
+  PROCS=$(ps -A -ww -o pid=,ppid=,command= 2>/dev/null || true)
+}
+
+# Prints "PID TAG" for each running watcher.
+list_watchers() {
+  printf '%s\n' "$PROCS" | awk -v p="$WATCH_PREFIX" '
+    NF >= 3 { n++; pid[n] = $1; par[$1] = $2; cmd[$1] = $3; w[$1] = (index($3, p) == 1) }
+    END {
+      for (i = 1; i <= n; i++) {
+        q = pid[i]
+        if (w[q] && !w[par[q]]) { t = cmd[q]; sub("^" p, "", t); print q, t }
+      }
+    }'
+}
+
+# Prints "PID PPID TAG" for each tagged caffeinate, 0.2.0's included.
+list_caffeinates() {
+  printf '%s\n' "$PROCS" | awk -v p="$CAFF_PATTERN" -v pre="$CAFF_PREFIX" '
+    NF >= 3 && $3 ~ p { t = $3; sub(".*/", "", t); sub("^" pre, "", t); print $1, $2, t }'
+}
+
+# The caffeinate under watcher $1, if any.
+caffeinate_of() {
+  list_caffeinates | awk -v w="$1" '$2 == w { print $1; exit }'
+}
+
+pid_alive() {
+  [ "$1" != 0 ] && kill -0 "$1" 2>/dev/null
+}
+
+# ---------- the stop log ----------
+
+log_stop() {
+  local sid="$1" holder="$2" reason="$3" at="$4" now
+  now=$(date +%s)
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return 0
+  printf '%s session=%s holder=%s reason=%s ran=%s start=%s stop=%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$sid" "$holder" "$reason" \
+    "$(fmt_duration $((now > at ? now - at : 0)))" "$at" "$now" \
+    >>"$LOG_FILE" 2>/dev/null || return 0
+  local link="$STATE_DIR/claffeinate.log"
+  if [ "$link" != "$LOG_FILE" ] && [ ! -e "$link" ] && [ ! -L "$link" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null && ln -s "$LOG_FILE" "$link" 2>/dev/null
+  fi
+  local lines
+  lines=$(wc -l <"$LOG_FILE" 2>/dev/null | tr -d ' ')
+  if [ "${lines:-0}" -gt "$LOG_MAX_LINES" ]; then
+    tail -n "$LOG_KEEP_LINES" "$LOG_FILE" >"${LOG_FILE}.tmp.$$" &&
+      mv "${LOG_FILE}.tmp.$$" "$LOG_FILE"
+  fi
+  return 0
+}
+
+# ---------- battery ----------
+
+# Reads the battery into B_PRESENT (1 or 0), B_PCT, B_CUR and B_MAX (mAh),
+# B_AMP (mA, negative while draining) and B_EXT (1 on external power).
+read_battery() {
+  local out
+  B_PRESENT=0 B_PCT="" B_CUR="" B_MAX="" B_AMP=0 B_EXT=1
+  out=$(ioreg -rn AppleSmartBattery 2>/dev/null || true)
+  [ -n "$out" ] || return 0
+  local key val
+  while read -r key val; do
+    case "$key" in
+    CurrentCapacity) B_PCT=$val ;;
+    AppleRawCurrentCapacity) B_CUR=$val ;;
+    AppleRawMaxCapacity) B_MAX=$val ;;
+    # ioreg prints a negative current as its unsigned 64-bit value; bash
+    # arithmetic wraps it back.
+    Amperage) B_AMP=$((val)) ;;
+    ExternalConnected) [ "$val" = Yes ] && B_EXT=1 || B_EXT=0 ;;
+    BatteryInstalled) [ "$val" = Yes ] && B_PRESENT=1 ;;
+    esac
+  done < <(printf '%s\n' "$out" | sed -n 's/^[[:space:]|]*"\([A-Za-z]*\)" = \([A-Za-z0-9-]*\)$/\1 \2/p')
+  [ -n "$B_PCT" ] && [ -n "$B_CUR" ] && [ -n "$B_MAX" ] && [ "$B_MAX" -gt 0 ] || B_PRESENT=0
+}
+
+# When the charge reaches floor $1 at the current drain, or nothing when
+# it isn't draining.
+battery_end() {
+  local floor="$1"
+  [ "$B_PRESENT" = 1 ] && [ "$floor" -gt 0 ] || return 0
+  if [ "$B_PCT" -le "$floor" ]; then
+    printf '%s\n' "$NOW"
+    return 0
+  fi
+  [ "$B_AMP" -lt 0 ] || return 0
+  local left=$((B_CUR * 100 - floor * B_MAX))
+  [ "$left" -gt 0 ] || left=0
+  printf '%s\n' "$((NOW + left * 36 / (-B_AMP)))"
+}
+
+# ---------- the watcher ----------
+
+# Runs one hold: starts its caffeinate, then ends it on the first limit
+# reached, and logs why.
+cmd_watch() {
+  set +e
+  local tag="$1" flags="$2" target="$3"
+  parse_tag "$tag" || exit 2
+  local sid="$P_SID" holder="$P_HOLDER" claude="$P_CLAUDE"
+  local max="$P_MAX" floor="$P_FLOOR" at="$P_AT"
+  local cargs=("-$flags")
+  [ "$target" != 0 ] && cargs+=(-w "$target")
+  (exec -a "${CAFF_PREFIX}${tag}" caffeinate "${cargs[@]}") </dev/null >/dev/null 2>&1 &
+  local caf=$! reason="" timer="" now nap
+  trap 'reason=ended' USR1
+  trap 'reason=killed' TERM INT
+  trap ':' USR2
+  trap '' HUP
+  while [ -z "$reason" ]; do
+    if ! kill -0 "$caf" 2>/dev/null; then
+      if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
+        reason="claude-exited"
+      else
+        reason=ended
+      fi
+      break
+    fi
+    if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
+      reason="claude-exited"
+      break
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge $((at + max)) ]; then
+      reason=cap
+      break
+    fi
+    if [ "$floor" -gt 0 ]; then
+      read_battery
+      if [ "$B_PRESENT" = 1 ] && [ "$B_PCT" -le "$floor" ]; then
+        reason=battery
+        break
+      fi
+    fi
+    nap=$((at + max - now))
+    [ "$nap" -gt "$WATCH_INTERVAL" ] && nap=$WATCH_INTERVAL
+    # Waiting on caffeinate itself ends the nap the moment it exits; the
+    # timer's USR2 ends it otherwise.
+    (sleep "$nap" && kill -USR2 $$) </dev/null >/dev/null 2>&1 &
+    timer=$!
+    wait "$caf"
+    pkill -P "$timer" 2>/dev/null
+    kill "$timer" 2>/dev/null
+  done
+  kill "$caf" 2>/dev/null
+  log_stop "$sid" "$holder" "$reason" "$at"
+  exit 0
+}
+
 # ---------- help ----------
 
 usage() {
   cat <<'EOF'
-claffeinate -- keep your Mac awake while Claude Code works, one tab at a time
+claffeinate -- keep your Mac awake only while Claude Code is working
 
-Each caffeinate(1) instance is tagged with the Claude Code tab that started
-it, so a closed tab's keep-awake can be found and stopped without touching
-the ones other tabs still need.
+Each hold keeps the Mac awake for one thing that is working: a turn, a
+subagent or a background shell. It ends when that thing ends, when its
+claude process exits, after awake-max-duration (4h), or once the battery
+is down to awake-min-battery (20%).
 
 Usage:
   claffeinate <command> [options]
 
 Commands:
-  start           keep this Mac awake on behalf of this tab
-  list            list every instance and whether its tab is still open
-  status          list, plus each owning claude PID and uptime
-  kill-mine       stop this tab's instance
-  kill-orphans    stop every instance whose tab has closed
-  claude-pid      find the claude process behind a tab
+  start           start a hold
+  stop            end a hold
+  status          when the Mac will be allowed to sleep, and every hold
+  list            every hold, one tab-separated row each
+  kill-session    end every hold of a session
+  kill-orphans    end holds whose claude has exited, and stray processes
+  config          show or change the settings
   help [COMMAND]  show this help, or a command's
 
+Any command takes --no-emoji or --emoji.
 Run 'claffeinate COMMAND --help' for a command's options and examples.
 
 Exit codes:
@@ -254,29 +647,56 @@ EOF
 
 usage_start() {
   cat <<'EOF'
-Usage: claffeinate start [--display] [--idle] [--disk] [--system] [--user]
-                         [--timeout DURATION]
+Usage: claffeinate start [--holder HOLDER] [--session ID] [--claude-pid PID]
+                         [--wait-pid PID] [--awake-max-duration DURATION]
+                         [--awake-min-battery PERCENT] [--keep-display-on]
 
-Keep this Mac awake on behalf of the current Claude Code tab for 10 minutes,
-or for --timeout, and print the PID of the instance. A tab has one instance:
-running start again replaces it, with the new flags and a fresh timeout. Run
-start whenever the agent does something, and the Mac stays awake until it
-has been quiet for 10 minutes.
+Start a hold and print its watcher's PID. A hold keeps the Mac from
+sleeping while you're away; the display still turns off, unless you pass
+--keep-display-on. A holder has one hold: start for a holder that already
+has one prints that hold's PID and does nothing else.
 
-Options (combine any; with none, --display is used):
-  --display           keep the display from sleeping    (caffeinate -d)
-  --idle              keep the system from idle sleep   (caffeinate -i)
-  --disk              keep the disk from idle sleep     (caffeinate -m)
-  --system            keep the system awake, on AC only (caffeinate -s)
-  --user              declare that the user is active   (caffeinate -u)
-  --timeout DURATION  stop by itself after DURATION instead of 10m:
-                      30s, 60m, 1h30m, 2d; a bare number is seconds
+The hold ends when the first of these happens:
+  - claffeinate stop, kill-session or kill-orphans ends it
+  - the --wait-pid process exits
+  - the --claude-pid process exits
+  - awake-max-duration has passed
+  - the battery is at or below awake-min-battery, on AC power too
+
+Options:
+  --holder HOLDER     turn, subagent-ID, shell-ID or manual (default)
+  --session ID        the Claude Code session; default
+                      $CLAUDE_CODE_SESSION_ID, or "none"
+  --claude-pid PID    the claude process; default $CLAUDE_PID, or none
+  --wait-pid PID      end the hold when PID exits; default the claude PID
+  --awake-max-duration DURATION
+                      the longest the hold keeps the Mac awake: 30s, 60m,
+                      1h30m, 2d; a bare number is seconds (default 4h)
+  --awake-min-battery PERCENT
+                      end the hold at this battery level; 0 never
+                      (default 20)
+  --keep-display-on   keep the display on too
   --help              show this help
+
+See 'claffeinate config --help' for where the two limits can be set.
 
 Examples:
   claffeinate start
-  claffeinate start --idle --display
-  claffeinate start --timeout 1h30m
+  claffeinate start --keep-display-on --awake-max-duration 1h30m
+EOF
+}
+
+usage_stop() {
+  cat <<'EOF'
+Usage: claffeinate stop [--holder HOLDER] [--session ID]
+
+End a session's hold for HOLDER (default manual), logging it as "ended".
+Exits 3 if there is no such hold.
+
+Options:
+  --holder HOLDER  turn, subagent-ID, shell-ID or manual (default)
+  --session ID     default $CLAUDE_CODE_SESSION_ID, or "none"
+  --help           show this help
 EOF
 }
 
@@ -284,12 +704,13 @@ usage_list() {
   cat <<'EOF'
 Usage: claffeinate list [--json]
 
-List every claffeinate instance on this Mac, one tab-separated row each:
+List every hold on this Mac, one tab-separated row each:
 
-  PID  TERM_SESSION_ID  SSE_PORT  DIR  alive|dead
+  PID  SESSION  HOLDER  CLAUDE_PID  alive|dead  STARTED  MAX  FLOOR
 
-"dead" means no running Claude Code tab matches the instance, so
-kill-orphans would stop it.
+PID is the watcher's; STARTED is in epoch seconds and MAX in seconds.
+"dead" means its caffeinate or its claude process is gone, so
+kill-orphans would end it.
 
 Options:
   --json  print a JSON array instead (needs jq)
@@ -302,32 +723,40 @@ EOF
 
 usage_status() {
   cat <<'EOF'
-Usage: claffeinate status [--json]
+Usage: claffeinate status [--explain] [--stops N] [--json]
 
-Like list, with two more columns: the PID of the claude process that owns
-the instance ("-" once its tab has closed), and how long the instance has
-been running.
+Show when the Mac will be allowed to sleep, every hold, and the holds
+that stopped last. The output has the same lines in the same order every
+time, with "-" for a value that doesn't apply, so two readings line up.
 
-  PID  TERM_SESSION_ID  SSE_PORT  DIR  alive|dead  CLAUDE_PID  UPTIME_SECONDS
+  💤 sleep    when the Mac is expected to sleep if you stay away; by=
+              names the limit that decides it: time, battery or macos
+  ⏳ time     when awake-max-duration ends the last hold
+  🔋 battery  when the battery reaches awake-min-battery at its current
+              drain
+  💻 macos    when macOS would sleep if the last hold ended now
 
-Warns on stderr if no claude process is running at all.
+Each moment is a clock time and its signed distance from now: +3h12m
+ahead, -40s behind.
 
 Options:
-  --json  print a JSON array instead (needs jq)
-  --help  show this help
+  --explain  add how macOS decides to sleep, with this Mac's settings
+  --stops N  show the last N stopped holds (default 5)
+  --json     print the same as JSON (needs jq)
+  --help     show this help
 EOF
 }
 
-usage_kill_mine() {
+usage_kill_session() {
   cat <<'EOF'
-Usage: claffeinate kill-mine
+Usage: claffeinate kill-session [--session ID]
 
-Stop the instance this Claude Code tab started, and remove its pidfile and
-symlink. Instances from other tabs are left alone. Exits 3 if this tab has
-no instance.
+End every hold of a session, logging each as "killed". Holds of other
+sessions are left alone. Exits 3 if the session has none.
 
 Options:
-  --help  show this help
+  --session ID  default $CLAUDE_CODE_SESSION_ID, or "none"
+  --help        show this help
 EOF
 }
 
@@ -335,15 +764,17 @@ usage_kill_orphans() {
   cat <<'EOF'
 Usage: claffeinate kill-orphans [--dry-run]
 
-Stop every instance whose Claude Code tab has closed, and every heartbeat
-loop that has lost its caffeinate. An instance whose tab is still open is
-never touched. An instance started outside Claude Code has no tab to match,
-so it always counts as an orphan.
+End what nothing will end by itself:
 
-Prints one line for each process it stops:
+  - a hold whose claude process has exited
+  - a tagged caffeinate whose watcher is gone
+  - a watcher whose caffeinate is gone
+  - 0.2.0's instances and heartbeat loops
 
-  killed PID TAG
-  killed PID heartbeat
+and delete the session settings files of sessions whose claude has
+exited. Prints one line for each process it stops:
+
+  killed PID NAME (WHY)
 
 Options:
   --dry-run  print "would kill ..." instead, and stop nothing
@@ -354,23 +785,43 @@ Example, reaping in the background at shell startup:
 EOF
 }
 
-usage_claude_pid() {
+usage_config() {
   cat <<'EOF'
-Usage: claffeinate claude-pid --term-session-id ID --sse-port PORT
+Usage: claffeinate config [--session ID]
+       claffeinate config set (--session ID | --global) SETTING VALUE
+       claffeinate config unset (--session ID | --global) SETTING
 
-Print the PID of the claude process whose environment has both
-TERM_SESSION_ID=ID and CLAUDE_CODE_SSE_PORT=PORT. This is the check that
-decides whether an instance's tab is still open. Exits 1 if no claude
-process matches.
+Show each setting's value and the layer it came from, or change one.
+
+Settings:
+  awake-max-duration  the longest one hold keeps the Mac awake (4h)
+  awake-min-battery   the battery percent at which holds end; 0 never (20)
+  emoji               on or off, for the status output (on)
+
+Layers, strongest first:
+  flag     --awake-max-duration, --awake-min-battery, --emoji/--no-emoji
+  session  $XDG_STATE_HOME/claffeinate/sessions/ID.conf, which
+           /claffeinate:set writes
+  env      CLAFFEINATE_AWAKE_MAX_DURATION, CLAFFEINATE_AWAKE_MIN_BATTERY,
+           CLAFFEINATE_EMOJI; Claude Code takes these from --settings,
+           then .claude/settings.json, then ~/.claude/settings.json, then
+           the environment it was started in
+  config   $XDG_CONFIG_HOME/claffeinate/config (~/.config/claffeinate/config)
+  default
+
+Both files hold "setting = value" lines. A setting takes effect for holds
+started after the change.
 
 Options:
-  --term-session-id ID  the tab's TERM_SESSION_ID (required)
-  --sse-port PORT       the tab's CLAUDE_CODE_SSE_PORT (required)
-  --help                show this help
+  --session ID  the session to show or change; default
+                $CLAUDE_CODE_SESSION_ID for show
+  --global      change the config file
+  --help        show this help
 
-Example:
-  claffeinate claude-pid --term-session-id "$TERM_SESSION_ID" \
-    --sse-port "$CLAUDE_CODE_SSE_PORT"
+Examples:
+  claffeinate config
+  claffeinate config set --global awake-min-battery 30
+  claffeinate config set --session "$CLAUDE_CODE_SESSION_ID" awake-max-duration 8h
 EOF
 }
 
@@ -379,11 +830,12 @@ cmd_help() {
   case "${1:-}" in
   "") usage ;;
   start) usage_start ;;
+  stop) usage_stop ;;
   list) usage_list ;;
   status) usage_status ;;
-  kill-mine) usage_kill_mine ;;
+  kill-session) usage_kill_session ;;
   kill-orphans) usage_kill_orphans ;;
-  claude-pid) usage_claude_pid ;;
+  config) usage_config ;;
   *)
     printf "error: unknown command: %s (see 'claffeinate --help')\n" "$1" >&2
     return 2
@@ -391,380 +843,665 @@ cmd_help() {
   esac
 }
 
-# Reports a flag the command doesn't accept, and where its flags are listed.
-unknown_flag() {
-  printf "error: unknown flag for %s: %s (see 'claffeinate %s --help')\n" \
-    "$1" "$2" "$1" >&2
-}
+# ---------- start and stop ----------
 
-# ---------- shared row emitter ----------
-
-emit_rows() {
-  local pids pid tag parsed term_sid sse_port dir alive
-  pids=$(list_tagged_pids)
-  for pid in $pids; do
-    tag=$(tag_for_pid "$pid")
-    [ -z "$tag" ] && continue
-    case "$tag" in
-    ${TAG_PREFIX}*) ;;
-    *) continue ;;
-    esac
-    parsed=$(parse_tag "$tag")
-    read -r term_sid sse_port dir <<<"$parsed"
-    if tab_is_alive "$term_sid" "$sse_port"; then
-      alive="alive"
-    else
-      alive="dead"
+lock_holder() {
+  # Serializes `start` for one holder: hooks can fire together. The lock
+  # is a symlink whose target is the holder's PID, created atomically by
+  # `ln -s`, so there is never a lock without a holder; a lock whose
+  # holder has died is taken over. Gives up after about 10 seconds.
+  local lock="$1" holder tries=0
+  until ln -s "$$" "$lock" 2>/dev/null; do
+    holder=$(readlink "$lock" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock"
+      continue
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-      "$pid" "$term_sid" "$sse_port" "$dir" "$alive"
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] || return 1
+    sleep 0.05
   done
 }
 
-# ---------- subcommands ----------
+unlock_holder() {
+  [ "$(readlink "$1" 2>/dev/null || true)" = "$$" ] && rm -f "$1"
+  return 0
+}
+
+# Prints the PIDs of the watchers of session $1, of holder $2 when given.
+watchers_of() {
+  local sid="$1" holder="${2:-}" pid tag
+  while read -r pid tag; do
+    [ -n "$pid" ] || continue
+    parse_tag "$tag" || continue
+    [ "$P_SID" = "$sid" ] || continue
+    [ -z "$holder" ] || [ "$P_HOLDER" = "$holder" ] || continue
+    printf '%s\n' "$pid"
+  done < <(list_watchers)
+}
+
+default_session() {
+  printf '%s\n' "${CLAUDE_CODE_SESSION_ID:-none}"
+}
 
 cmd_start() {
-  local short_flags=""
-  local timeout=""
+  local flags="i" holder="manual" sid="" claude="${CLAUDE_PID:-0}" wait_pid=""
+  local max_flag="" floor_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
-    --display | -d)
-      short_flags="${short_flags}d"
-      shift
+    --keep-display-on) flags="di" && shift ;;
+    --display | -d) die "--display is now --keep-display-on" 2 ;;
+    --idle | -i | --disk | -m | --system | -s | --user | -u)
+      die "$1 is gone: every hold keeps the Mac from sleeping, and --keep-display-on keeps the display on too" 2
       ;;
-    --idle | -i)
-      short_flags="${short_flags}i"
-      shift
-      ;;
-    --disk | -m)
-      short_flags="${short_flags}m"
-      shift
-      ;;
-    --system | -s)
-      short_flags="${short_flags}s"
-      shift
-      ;;
-    --user | -u)
-      short_flags="${short_flags}u"
-      shift
-      ;;
-    --timeout | -t)
-      if [ $# -lt 2 ]; then
-        printf "error: --timeout requires a value\n" >&2
-        return 2
-      fi
-      if ! timeout=$(duration_to_seconds "$2"); then
-        printf "error: --timeout expects a duration like 30s, 60m, 1h30m: %s\n" "$2" >&2
-        return 2
-      fi
-      shift 2
-      ;;
-    --help | -h)
-      usage_start
-      return 0
-      ;;
-    *)
-      unknown_flag start "$1"
-      return 2
-      ;;
+    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --claude-pid) need_value "$1" $# && claude="$2" && shift 2 ;;
+    --wait-pid) need_value "$1" $# && wait_pid="$2" && shift 2 ;;
+    --awake-max-duration) need_value "$1" $# && max_flag="$2" && shift 2 ;;
+    --awake-min-battery) need_value "$1" $# && floor_flag="$2" && shift 2 ;;
+    --timeout | -t) die "--timeout is now --awake-max-duration" 2 ;;
+    --help | -h) usage_start && return 0 ;;
+    *) unknown_flag start "$1" ;;
     esac
   done
+  [ -n "$sid" ] || sid=$(default_session)
+  valid_word "$sid" || die "--session: not a session id: $sid" 2
+  case "$holder" in
+  turn | manual | subagent-?* | shell-?*) valid_word "$holder" ;;
+  *) false ;;
+  esac || die "--holder: expected turn, subagent-ID, shell-ID or manual: $holder" 2
+  [[ $claude =~ ^[0-9]+$ ]] || die "--claude-pid: not a PID: $claude" 2
+  [ -z "$wait_pid" ] || [[ $wait_pid =~ ^[1-9][0-9]*$ ]] || die "--wait-pid: not a PID: $wait_pid" 2
 
-  if [ -z "$short_flags" ]; then
-    short_flags="d"
-  fi
-  if [ -z "$timeout" ]; then
-    timeout=$(duration_to_seconds "$DEFAULT_TIMEOUT")
-  fi
+  resolve_setting awake-max-duration "$max_flag" "$sid"
+  local max="$R_VALUE"
+  resolve_setting awake-min-battery "$floor_flag" "$sid"
+  local floor="$R_VALUE"
 
-  local tag pidfile symlink lock caffeinate_bin
-  tag="$(current_tag)"
-  pidfile="${RUN_DIR}${tag}.pid"
-  symlink="${TAG_DIR}${tag}"
-  lock="${RUN_DIR}${tag}.lock"
-
-  caffeinate_bin="$(command -v caffeinate || true)"
-  if [ -z "$caffeinate_bin" ]; then
-    printf "error: caffeinate not found on PATH\n" >&2
-    return 1
-  fi
-  mkdir -p "$RUN_DIR" "$TAG_DIR"
-  if ! lock_tag "$lock"; then
-    printf "error: another start in this tab still holds %s\n" "$lock" >&2
-    return 1
+  command -v caffeinate >/dev/null 2>&1 || die "caffeinate not found on PATH"
+  local target="${wait_pid:-$claude}"
+  if [ "$target" != 0 ] && ! kill -0 "$target" 2>/dev/null; then
+    die "process $target is not running" 1
   fi
 
-  # A tab has one instance. The new one replaces it, taking the latest
-  # flags and restarting the timeout; it starts before the old one stops,
-  # so the Mac is never left without an assertion in between.
-  local previous
-  previous=$(cat "$pidfile" 2>/dev/null || true)
-  # The symlink stays as a kill-mine fallback marker (its presence /
-  # removal is part of the contract), but we never exec it -- some
-  # sandboxes (notably sandboxed macOS Nix builds) block exec on the
-  # build volume even though writes are fine. Instead, exec the real
-  # caffeinate(1) and override argv[0] with the symlink path via
-  # `exec -a`, which gives the same observable tag in `ps`/`pgrep`.
-  ln -sf "$caffeinate_bin" "$symlink"
-
-  local logfile="${RUN_DIR}${tag}.log"
-  # The heartbeat is caffeinate(1)'s utility, and caffeinate ignores -t when
-  # given one, so the loop enforces the timeout ($2) itself; caffeinate
-  # exits when its utility does. The loop also exits once its tagged
-  # caffeinate child (argv[0] under $1, the symlink dir) is gone, since
-  # nothing else would ever stop it.
-  # shellcheck disable=SC2016 # body is run under sh -c later, so $-vars must stay literal here
-  local heartbeat='deadline=${2:+$(($(date +%s) + $2))}; while pgrep -q -P $$ -f -- "$1"; do nap=60; if [ -n "$deadline" ]; then left=$((deadline - $(date +%s))); [ "$left" -gt 0 ] || exit 0; [ "$left" -lt "$nap" ] && nap=$left; fi; printf "[%s] awake (full-dir=%s)\n" "$(date +%T)" "$PWD"; sleep "$nap"; done'
-
-  (exec -a "$symlink" "$caffeinate_bin" "-${short_flags}" sh -c "$heartbeat" sh "$TAG_DIR" "$timeout") \
-    >"$logfile" 2>&1 &
+  mkdir -p "${RUN_DIR}locks"
+  local lock="${RUN_DIR}locks/${sid}--${holder}"
+  lock_holder "$lock" || die "another start for $holder still holds $lock"
+  local existing
+  load_procs
+  existing=$(watchers_of "$sid" "$holder")
+  existing=${existing%%$'\n'*}
+  if [ -n "$existing" ]; then
+    unlock_holder "$lock"
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  local tag at
+  at=$(date +%s)
+  tag="session-${sid}--holder-${holder}--claude-${claude}--max-${max}--floor-${floor}--at-${at}"
+  (exec -a "${WATCH_PREFIX}${tag}" "$BASH" "$SELF" __watch "$tag" "$flags" "$target") \
+    </dev/null >/dev/null 2>&1 &
   local pid=$!
-  printf '%s\n' "$pid" >"$pidfile"
-  printf '%s\n' "$pid"
   disown "$pid" 2>/dev/null || true
-  if [ -n "$previous" ] && [ "$previous" != "$pid" ]; then
-    stop_instance "$previous"
-  fi
-  unlock_tag "$lock"
+  # Wait for the caffeinate, so the hold is in force when start returns.
+  local tries=0
+  load_procs
+  while [ -z "$(caffeinate_of "$pid")" ] && [ "$tries" -lt 40 ]; do
+    tries=$((tries + 1))
+    sleep 0.05
+    load_procs
+  done
+  unlock_holder "$lock"
+  printf '%s\n' "$pid"
+}
+
+cmd_stop() {
+  local holder="manual" sid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --help | -h) usage_stop && return 0 ;;
+    *) unknown_flag stop "$1" ;;
+    esac
+  done
+  [ -n "$sid" ] || sid=$(default_session)
+  local pids
+  load_procs
+  pids=$(watchers_of "$sid" "$holder")
+  [ -n "$pids" ] || return 3
+  # shellcheck disable=SC2086 # one PID per word
+  kill -USR1 $pids 2>/dev/null || true
+}
+
+cmd_kill_session() {
+  local sid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --help | -h) usage_kill_session && return 0 ;;
+    *) unknown_flag kill-session "$1" ;;
+    esac
+  done
+  [ -n "$sid" ] || sid=$(default_session)
+  local pids
+  load_procs
+  pids=$(watchers_of "$sid")
+  [ -n "$pids" ] || return 3
+  # shellcheck disable=SC2086 # one PID per word
+  kill -TERM $pids 2>/dev/null || true
+}
+
+# ---------- holds, for status and list ----------
+
+# Fills the H_* arrays with every hold, one index per watcher.
+H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_AT=() H_STATE=()
+collect_holds() {
+  local pid tag caf state
+  H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_AT=() H_STATE=()
+  load_procs
+  while read -r pid tag; do
+    [ -n "$pid" ] || continue
+    parse_tag "$tag" || continue
+    caf=$(caffeinate_of "$pid")
+    state=alive
+    if [ -z "$caf" ] || { [ "$P_CLAUDE" != 0 ] && ! pid_alive "$P_CLAUDE"; }; then
+      state=dead
+    fi
+    H_PID+=("$pid") H_CAF+=("${caf:-0}") H_SID+=("$P_SID") H_HOLDER+=("$P_HOLDER")
+    H_CLAUDE+=("$P_CLAUDE") H_MAX+=("$P_MAX") H_FLOOR+=("$P_FLOOR") H_AT+=("$P_AT")
+    H_STATE+=("$state")
+  done < <(list_watchers)
 }
 
 cmd_list() {
-  local json=0
+  local json=0 i
   while [ $# -gt 0 ]; do
     case "$1" in
-    --json | -j)
-      json=1
-      shift
-      ;;
-    --help | -h)
-      usage_list
-      return 0
-      ;;
-    *)
-      unknown_flag list "$1"
-      return 2
-      ;;
+    --json | -j) json=1 && shift ;;
+    --help | -h) usage_list && return 0 ;;
+    *) unknown_flag list "$1" ;;
     esac
   done
-
-  if [ "$json" = "1" ]; then
-    require_jq
-    emit_rows | jq -Rn '
-      [inputs | select(length > 0) | split("\t") | {
-        pid: .[0],
-        term_sid: .[1],
-        sse_port: .[2],
-        dir: .[3],
-        alive: (.[4] == "alive")
-      }]
-    '
+  [ "$json" = 0 ] || require_jq
+  collect_holds
+  {
+    for ((i = 0; i < ${#H_PID[@]}; i++)); do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${H_PID[$i]}" "${H_SID[$i]}" \
+        "${H_HOLDER[$i]}" "${H_CLAUDE[$i]}" "${H_STATE[$i]}" "${H_AT[$i]}" \
+        "${H_MAX[$i]}" "${H_FLOOR[$i]}"
+    done
+  } | if [ "$json" = 1 ]; then
+    jq -Rn '[inputs | select(length > 0) | split("\t") | {
+      pid: (.[0] | tonumber), session: .[1], holder: .[2],
+      claude_pid: (if .[3] == "0" then null else (.[3] | tonumber) end),
+      alive: (.[4] == "alive"), started: (.[5] | tonumber),
+      max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber)
+    }]'
   else
-    emit_rows
+    cat
   fi
+}
+
+# The session's name from its transcript: the last /rename, else the
+# generated title, else nothing.
+session_name() {
+  local sid="$1" files kind field line
+  [ "$sid" != none ] || return 0
+  files=$(ls "$CLAUDE_HOME"/projects/*/"$sid".jsonl 2>/dev/null || true)
+  [ -n "$files" ] || return 0
+  for kind in custom-title:customTitle ai-title:aiTitle; do
+    field="${kind#*:}"
+    # shellcheck disable=SC2086 # one path per word
+    line=$(grep -h "\"type\":\"${kind%%:*}\"" $files 2>/dev/null | tail -n 1 || true)
+    [ -n "$line" ] || continue
+    if command -v jq >/dev/null 2>&1; then
+      printf '%s' "$line" | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null && return 0
+    fi
+    printf '%s\n' "$line" | sed -n "s/.*\"$field\":\"\\([^\"]*\\)\".*/\\1/p"
+    return 0
+  done
+}
+
+short_name() {
+  local n="$1"
+  if [ "${#n}" -gt "$NAME_WIDTH" ]; then
+    n="${n:0:$((NAME_WIDTH - 1))}…"
+  fi
+  printf '%s\n' "${n:--}"
+}
+
+# ---------- how macOS decides to sleep ----------
+
+# The macOS-specific part of the forecast. A port to another OS replaces
+# this function: Linux has systemd-inhibit and logind's IdleActionSec.
+#
+# Sets M_SOURCE (AC, battery or UPS), M_DISPLAY and M_SLEEP (the current
+# source's displaysleep and sleep, in minutes; 0 is never), M_INPUT (the
+# epoch of the last keyboard, mouse or trackpad input) and M_OTHER (other
+# processes holding a sleep or display assertion, as NAME:PID,
+# comma-joined). Our own
+# caffeinate PIDs are in $1, space-separated.
+macos_sleep_model() {
+  local ours=" ${1:-} " batt section idle_ns
+  batt=$(pmset -g batt 2>/dev/null | head -n 1 || true)
+  case "$batt" in
+  *"'Battery Power'"*) M_SOURCE=battery section="Battery Power:" ;;
+  *"'UPS Power'"*) M_SOURCE=UPS section="UPS Power:" ;;
+  *) M_SOURCE=AC section="AC Power:" ;;
+  esac
+  local custom
+  custom=$(pmset -g custom 2>/dev/null || true)
+  M_DISPLAY=$(printf '%s\n' "$custom" | awk -v s="$section" -v k=displaysleep '
+    /^[A-Za-z].*:$/ { in_s = ($0 == s); seen = seen || in_s; next }
+    $1 == k { if (in_s) { v = $2; got = 1 } else if (!got) first = $2 }
+    END { print (got ? v : (first == "" ? 0 : first)) }')
+  M_SLEEP=$(printf '%s\n' "$custom" | awk -v s="$section" -v k=sleep '
+    /^[A-Za-z].*:$/ { in_s = ($0 == s); next }
+    $1 == k { if (in_s) { v = $2; got = 1 } else if (!got) first = $2 }
+    END { print (got ? v : (first == "" ? 0 : first)) }')
+  idle_ns=$(ioreg -c IOHIDSystem -d 4 2>/dev/null | awk '/"HIDIdleTime" =/ { print $NF; exit }' || true)
+  [[ ${idle_ns:-} =~ ^[0-9]+$ ]] || idle_ns=0
+  M_INPUT=$((NOW - idle_ns / 1000000000))
+  M_OTHER=$(pmset -g assertions 2>/dev/null | awk -v ours="$ours" '
+    /^Listed by owning process:/ { listed = 1; next }
+    /^[A-Za-z]/ { listed = 0 }
+    listed && /^[[:space:]]+pid [0-9]+\(/ {
+      if ($0 !~ /PreventUserIdleSystemSleep|PreventSystemSleep|PreventUserIdleDisplaySleep|NoIdleSleepAssertion|NoDisplaySleepAssertion/) next
+      pid = $2; name = $2
+      sub(/\(.*/, "", pid); sub(/^[0-9]+\(/, "", name); sub(/\):.*/, "", name)
+      if (name == "powerd") next
+      if (index(ours, " " pid " ")) next
+      if (!(pid in seen)) { seen[pid] = 1; out = out (out == "" ? "" : ",") name ":" pid }
+    }
+    END { print out }' || true)
+}
+
+# When macOS would sleep if the last hold ended at $1, or nothing while
+# something prevents it.
+macos_sleep_at() {
+  local t="$1"
+  [ -z "$M_OTHER" ] && [ "$M_DISPLAY" -gt 0 ] && [ "$M_SLEEP" -gt 0 ] || return 0
+  local a=$((M_INPUT + M_DISPLAY * 60)) b=$((M_INPUT + M_SLEEP * 60))
+  [ "$a" -gt "$t" ] && t=$a
+  [ "$b" -gt "$t" ] && t=$b
+  printf '%s\n' "$t"
+}
+
+# ---------- status ----------
+
+# The forecast, computed once for text and JSON. Sets F_* variables.
+forecast() {
+  local i end bat ours="" n=${#H_PID[@]}
+  read_battery
+  for ((i = 0; i < n; i++)); do
+    [ "${H_CAF[$i]}" = 0 ] || ours+="${H_CAF[$i]} "
+  done
+  macos_sleep_model "$ours"
+
+  # time: the latest cap among the holds
+  F_TIME="" F_CAP="$DEF_MAX"
+  F_FLOOR="$DEF_FLOOR" F_BATTERY=""
+  F_END="" F_BY=""
+  H_END=() H_BY=()
+  local first=1
+  for ((i = 0; i < n; i++)); do
+    end=$((H_AT[i] + H_MAX[i]))
+    if [ -z "$F_TIME" ] || [ "$end" -gt "$F_TIME" ]; then
+      F_TIME=$end F_CAP=${H_MAX[$i]}
+    fi
+    if [ "$first" = 1 ] || [ "${H_FLOOR[$i]}" -lt "$F_FLOOR" ]; then
+      F_FLOOR=${H_FLOOR[$i]}
+    fi
+    first=0
+    bat=$(battery_end "${H_FLOOR[$i]}")
+    if [ -n "$bat" ] && [ "$bat" -lt "$end" ]; then
+      H_END+=("$bat") H_BY+=(battery)
+    else
+      H_END+=("$end") H_BY+=(time)
+    fi
+    if [ -z "$F_END" ] || [ "${H_END[$i]}" -gt "$F_END" ]; then
+      F_END=${H_END[$i]} F_BY=${H_BY[$i]}
+    fi
+  done
+  [ "$n" -gt 0 ] && F_BATTERY=$(battery_end "$F_FLOOR")
+
+  F_MACOS=$(macos_sleep_at "$NOW")
+  if [ "$n" -gt 0 ]; then
+    F_SLEEP=$(macos_sleep_at "$F_END")
+    if [ -n "$F_SLEEP" ] && [ "$F_SLEEP" -gt "$F_END" ]; then
+      F_BY=macos
+    fi
+    [ -n "$F_SLEEP" ] || F_BY=macos
+  else
+    F_SLEEP="$F_MACOS" F_BY=macos
+  fi
+}
+
+# The clock and signed-distance cells of moment $1, or "-" twice.
+moment_cells() {
+  if [ -n "$1" ]; then
+    printf '%s\t%s\n' "$(fmt_clock "$1")" "$(fmt_rel "$1")"
+  else
+    printf -- '-\t-\n'
+  fi
+}
+
+battery_details() {
+  if [ "$B_PRESENT" != 1 ]; then
+    printf 'none\n'
+    return
+  fi
+  local floor="floor=${F_FLOOR}%" rate="rate=0"
+  [ "$F_FLOOR" -gt 0 ] || floor="floor=off"
+  if [ "$B_AMP" -lt 0 ]; then
+    rate="rate=-$(((-B_AMP) * 100 / B_MAX))%/h"
+  fi
+  printf 'now=%s%% %s %s\n' "$B_PCT" "$floor" "$rate"
+}
+
+macos_details() {
+  local d="never" s="never"
+  [ "$M_DISPLAY" -gt 0 ] && d=$(fmt_duration $((M_DISPLAY * 60)))
+  [ "$M_SLEEP" -gt 0 ] && s=$(fmt_duration $((M_SLEEP * 60)))
+  printf 'input=%s display=%s sleep=%s other=%s\n' \
+    "$(fmt_moment "$M_INPUT")" "$d" "$s" "${M_OTHER:--}"
+}
+
+print_status_text() {
+  local stops="$1" explain="$2" i n=${#H_PID[@]} c
+  printf 'claffeinate  %s  macOS %s  power=%s  holds=%d\n' \
+    "$(date_fmt "$NOW" '%Y-%m-%d %H:%M')" "$(sw_vers -productVersion 2>/dev/null || printf '?')" \
+    "$M_SOURCE" "$n"
+
+  local sleep_details="by=$F_BY"
+  [ -z "$M_OTHER" ] || sleep_details+=" other=$M_OTHER"
+  table_reset 10 5 6
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_SLEEP")"
+  table_row "$(marked sleep sleep)" "${c[0]}" "${c[1]}" "$sleep_details"
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_TIME")"
+  table_row "$(marked time time)" "${c[0]}" "${c[1]}" "cap=$(fmt_duration "$F_CAP")"
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_BATTERY")"
+  table_row "$(marked battery battery)" "${c[0]}" "${c[1]}" "$(battery_details)"
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_MACOS")"
+  table_row "$(marked macos macos)" "${c[0]}" "${c[1]}" "$(macos_details)"
+  table_print
+
+  printf '\n'
+  table_reset 5 8 "$NAME_WIDTH" "$HOLDER_WIDTH" 6 8 5 6 5 6
+  table_row PID SESSION NAME HOLDER CLAUDE STATE STARTED "" ENDS "" ""
+  local s e claude
+  for ((i = 0; i < n; i++)); do
+    IFS=$'\t' read -r -a s <<<"$(moment_cells "${H_AT[$i]}")"
+    IFS=$'\t' read -r -a e <<<"$(moment_cells "${H_END[$i]}")"
+    claude=${H_CLAUDE[$i]}
+    [ "$claude" != 0 ] || claude=-
+    table_row "${H_PID[$i]}" "${H_SID[$i]:0:8}" "$(short_name "$(session_name "${H_SID[$i]}")")" \
+      "$(marked "$(holder_kind "${H_HOLDER[$i]}")" "${H_HOLDER[$i]}")" "$claude" \
+      "$(marked "${H_STATE[$i]}" "${H_STATE[$i]}")" "${s[0]}" "${s[1]}" \
+      "${e[0]}" "${e[1]}" "$(marked "${H_BY[$i]}" "${H_BY[$i]}")"
+  done
+  [ "$n" -gt 0 ] || table_none
+  table_print
+
+  printf '\n'
+  table_reset 5 6 8 "$NAME_WIDTH" "$HOLDER_WIDTH" 16
+  table_row STOPPED "" SESSION NAME HOLDER REASON RAN
+  local rows=0 sid holder reason ran start stop
+  while read -r _ sid holder reason ran start stop; do
+    sid=${sid#session=} holder=${holder#holder=} reason=${reason#reason=}
+    ran=${ran#ran=} stop=${stop#stop=}
+    [[ $stop =~ ^[0-9]+$ ]] || continue
+    IFS=$'\t' read -r -a s <<<"$(moment_cells "$stop")"
+    table_row "${s[0]}" "${s[1]}" "${sid:0:8}" "$(short_name "$(session_name "$sid")")" \
+      "$(marked "$(holder_kind "$holder")" "$holder")" "$(marked "$reason" "$reason")" "$ran"
+    rows=$((rows + 1))
+  done < <(last_stops "$stops")
+  [ "$rows" -gt 0 ] || table_none
+  table_print
+
+  [ "$explain" = 1 ] || return 0
+  local d="never" sl="never"
+  [ "$M_DISPLAY" -gt 0 ] && d=$(fmt_duration $((M_DISPLAY * 60)))
+  [ "$M_SLEEP" -gt 0 ] && sl=$(fmt_duration $((M_SLEEP * 60)))
+  cat <<EOF
+
+How macOS decides to sleep, on this Mac now ($M_SOURCE power):
+- A hold is a caffeinate -i assertion, PreventUserIdleSystemSleep. Ending
+  it starts no new timer: it only stops preventing sleep.
+- macOS counts idle time from your last keyboard, mouse or trackpad
+  input, input=$(fmt_moment "$M_INPUT"), holds or not.
+- The display turns off once you've been idle for displaysleep, $d.
+  Until then powerd holds "Prevent sleep while display is on".
+- The Mac sleeps once you've been idle for both displaysleep and sleep,
+  $sl, unless another process holds an assertion: other=${M_OTHER:--}.
+- So once the last hold ends, the Mac sleeps at the latest of: that
+  moment, your last input + displaysleep, and your last input + sleep.
+  If you've been away longer than that already, it sleeps within seconds.
+- Each hold also ends when its claude process exits, after its cap
+  (awake-max-duration), or at its battery floor (awake-min-battery), on
+  AC power too: the watcher checks every $(fmt_duration "$WATCH_INTERVAL").
+EOF
+}
+
+# The last $1 lines of the stop log, newest first.
+last_stops() {
+  tail -n "$1" "$LOG_FILE" 2>/dev/null | awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' || true
+}
+
+# A moment as JSON: {"at": epoch, "in": seconds}, or null.
+json_moment() {
+  if [ -n "$1" ]; then
+    printf '{"at":%s,"in":%s}\n' "$1" "$(($1 - NOW))"
+  else
+    printf 'null\n'
+  fi
+}
+
+print_status_json() {
+  local stops="$1" i n=${#H_PID[@]} holds="[]" stopped="[]"
+  for ((i = 0; i < n; i++)); do
+    holds=$(jq -c --argjson h "$holds" --arg pid "${H_PID[$i]}" --arg sid "${H_SID[$i]}" \
+      --arg name "$(session_name "${H_SID[$i]}")" --arg holder "${H_HOLDER[$i]}" \
+      --arg claude "${H_CLAUDE[$i]}" --arg state "${H_STATE[$i]}" \
+      --arg at "${H_AT[$i]}" --arg max "${H_MAX[$i]}" --arg floor "${H_FLOOR[$i]}" \
+      --arg end "${H_END[$i]}" --arg by "${H_BY[$i]}" -n '$h + [{
+        pid: ($pid | tonumber), session: $sid, name: (if $name == "" then null else $name end),
+        holder: $holder, claude_pid: (if $claude == "0" then null else ($claude | tonumber) end),
+        alive: ($state == "alive"), started: ($at | tonumber), max_seconds: ($max | tonumber),
+        min_battery: ($floor | tonumber), ends: ($end | tonumber), ends_by: $by }]')
+  done
+  local sid holder reason ran start stop
+  while read -r _ sid holder reason ran start stop; do
+    stop=${stop#stop=}
+    [[ $stop =~ ^[0-9]+$ ]] || continue
+    sid=${sid#session=}
+    stopped=$(jq -c --argjson s "$stopped" --arg sid "$sid" --arg name "$(session_name "$sid")" \
+      --arg holder "${holder#holder=}" --arg reason "${reason#reason=}" --arg ran "${ran#ran=}" \
+      --arg start "${start#start=}" --arg stop "$stop" -n '$s + [{
+        stopped: ($stop | tonumber), started: ($start | tonumber), ran: $ran, session: $sid,
+        name: (if $name == "" then null else $name end), holder: $holder, reason: $reason }]')
+  done < <(last_stops "$stops")
+  local bat="null"
+  if [ "$B_PRESENT" = 1 ]; then
+    bat=$(jq -cn --argjson pct "$B_PCT" --argjson amp "$B_AMP" --argjson floor "$F_FLOOR" \
+      --argjson ext "$B_EXT" --argjson raw "$B_CUR" --argjson rawmax "$B_MAX" \
+      '{percent: $pct, floor: $floor, amperage_ma: $amp, capacity_mah: $raw,
+        max_capacity_mah: $rawmax, external_power: ($ext == 1)}')
+  fi
+  jq -n --argjson now "$NOW" --arg source "$M_SOURCE" \
+    --argjson sleep "$(json_moment "$F_SLEEP")" --arg by "$F_BY" \
+    --argjson time "$(json_moment "$F_TIME")" --argjson cap "$F_CAP" \
+    --argjson battery "$(json_moment "$F_BATTERY")" --argjson bat "$bat" \
+    --argjson macos "$(json_moment "$F_MACOS")" --argjson input "$M_INPUT" \
+    --argjson display "$M_DISPLAY" --argjson sl "$M_SLEEP" --arg other "$M_OTHER" \
+    --argjson holds "$holds" --argjson stops "$stopped" '{
+      now: $now, power: $source,
+      sleep: ($sleep + {by: $by}),
+      time: ($time + {cap_seconds: $cap}),
+      battery: ($battery + {state: $bat}),
+      macos: ($macos + {last_input: $input, displaysleep_minutes: $display,
+        sleep_minutes: $sl, other: (if $other == "" then [] else ($other | split(",")) end)}),
+      holds: $holds, stops: $stops }'
 }
 
 cmd_status() {
-  local json=0
+  local json=0 explain=0 stops=5
   while [ $# -gt 0 ]; do
     case "$1" in
-    --json | -j)
-      json=1
-      shift
-      ;;
-    --help | -h)
-      usage_status
-      return 0
-      ;;
-    *)
-      unknown_flag status "$1"
-      return 2
-      ;;
+    --json | -j) json=1 && shift ;;
+    --explain) explain=1 && shift ;;
+    --stops) need_value "$1" $# && stops="$2" && shift 2 ;;
+    --help | -h) usage_status && return 0 ;;
+    *) unknown_flag status "$1" ;;
     esac
   done
-
-  if [ "$json" = "1" ]; then
-    require_jq
-  fi
-
-  if ! pgrep -a -x "$CLAUDE_BIN_NAME" >/dev/null 2>&1; then
-    printf "warning: no '%s' process found machine-wide; stale install?\n" \
-      "$CLAUDE_BIN_NAME" >&2
-  fi
-
-  local rows=""
-  local pid term_sid sse_port dir alive claude_pid uptime etime
-  while IFS=$'\t' read -r pid term_sid sse_port dir alive; do
-    [ -z "$pid" ] && continue
-    if claude_pid=$(claude_pid_for "$term_sid" "$sse_port" 2>/dev/null); then
-      :
-    else
-      claude_pid="-"
-    fi
-    etime=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ' || true)
-    if [ -n "$etime" ]; then
-      uptime=$(etime_to_seconds "$etime")
-    else
-      uptime="0"
-    fi
-    rows+="${pid}	${term_sid}	${sse_port}	${dir}	${alive}	${claude_pid}	${uptime}"$'\n'
-  done < <(emit_rows)
-
-  if [ "$json" = "1" ]; then
-    if [ -z "$rows" ]; then
-      printf '[]\n'
-    else
-      printf '%s' "$rows" | jq -Rn '
-        [inputs | select(length > 0) | split("\t") | {
-          pid: .[0],
-          term_sid: .[1],
-          sse_port: .[2],
-          dir: .[3],
-          alive: (.[4] == "alive"),
-          claude_pid: (if .[5] == "-" then null else .[5] end),
-          uptime_seconds: (.[6] | tonumber)
-        }]
-      '
-    fi
+  [[ $stops =~ ^[0-9]+$ ]] || die "--stops: not a number: $stops" 2
+  [ "$json" = 0 ] || require_jq
+  local sid="${CLAUDE_CODE_SESSION_ID:-}"
+  resolve_setting awake-max-duration "" "$sid" 2>/dev/null
+  DEF_MAX="$R_VALUE"
+  resolve_setting awake-min-battery "" "$sid" 2>/dev/null
+  DEF_FLOOR="$R_VALUE"
+  collect_holds
+  forecast
+  if [ "$json" = 1 ]; then
+    print_status_json "$stops"
   else
-    printf '%s' "$rows"
+    print_status_text "$stops" "$explain"
   fi
 }
 
-cmd_kill_mine() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --help | -h)
-      usage_kill_mine
-      return 0
-      ;;
-    *)
-      unknown_flag kill-mine "$1"
-      return 2
-      ;;
-    esac
-  done
-
-  local tag pidfile symlink killed=0
-  tag="$(current_tag)"
-  pidfile="${RUN_DIR}${tag}.pid"
-  symlink="${TAG_DIR}${tag}"
-
-  if [ -f "$pidfile" ]; then
-    local pid
-    pid=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$pid" ] && kill "$pid" 2>/dev/null; then
-      killed=1
-    fi
-  else
-    if pkill -f -- "$tag" 2>/dev/null; then
-      killed=1
-    fi
-  fi
-
-  rm -f "$pidfile" "$symlink"
-
-  if [ "$killed" = "0" ]; then
-    return 3
-  fi
-}
+# ---------- kill-orphans ----------
 
 cmd_kill_orphans() {
   local dry_run=0
   while [ $# -gt 0 ]; do
     case "$1" in
-    --dry-run | -n)
-      dry_run=1
-      shift
-      ;;
-    --help | -h)
-      usage_kill_orphans
-      return 0
-      ;;
-    *)
-      unknown_flag kill-orphans "$1"
-      return 2
-      ;;
+    --dry-run | -n) dry_run=1 && shift ;;
+    --help | -h) usage_kill_orphans && return 0 ;;
+    *) unknown_flag kill-orphans "$1" ;;
     esac
   done
+  local now pid tag why watchers=" "
+  now=$(date +%s)
+  load_procs
 
-  local pids pid tag parsed term_sid sse_port dir pidfile_pid
-  pids=$(list_tagged_pids)
-  for pid in $pids; do
-    tag=$(tag_for_pid "$pid")
-    [ -z "$tag" ] && continue
-    case "$tag" in
-    ${TAG_PREFIX}*) ;;
-    *) continue ;;
-    esac
-    parsed=$(parse_tag "$tag")
-    read -r term_sid sse_port dir <<<"$parsed"
-    if tab_is_alive "$term_sid" "$sse_port"; then
-      continue
-    fi
-    if [ "$dry_run" = "1" ]; then
-      printf "would kill %s %s\n" "$pid" "$tag"
+  reap() {
+    # $1 PID, $2 process name, $3 why
+    if [ "$dry_run" = 1 ]; then
+      printf 'would kill %s %s (%s)\n' "$1" "$2" "$3"
     else
-      # The pidfile holds the heartbeat, caffeinate's parent; killing it
-      # takes the caffeinate down too, where killing only the caffeinate
-      # would leave the heartbeat running.
-      pidfile_pid=$(cat "${RUN_DIR}${tag}.pid" 2>/dev/null || true)
-      kill "$pid" ${pidfile_pid:+"$pidfile_pid"} 2>/dev/null || true
-      rm -f "${RUN_DIR}${tag}.pid" "${TAG_DIR}${tag}"
-      printf "killed %s %s\n" "$pid" "$tag"
+      kill "$1" 2>/dev/null || true
+      printf 'killed %s %s (%s)\n' "$1" "$2" "$3"
     fi
+  }
+
+  while read -r pid tag; do
+    [ -n "$pid" ] || continue
+    watchers+="$pid "
+    parse_tag "$tag" || continue
+    why=""
+    if [ "$P_CLAUDE" != 0 ] && ! pid_alive "$P_CLAUDE"; then
+      why="claude $P_CLAUDE exited"
+    elif [ -z "$(caffeinate_of "$pid")" ] && [ $((now - P_AT)) -gt 5 ]; then
+      # A just-started watcher may not have its caffeinate yet.
+      why="no caffeinate"
+    fi
+    [ -z "$why" ] || reap "$pid" "${WATCH_PREFIX}${tag}" "$why"
+  done < <(list_watchers)
+
+  local parent
+  while read -r pid parent tag; do
+    [ -n "$pid" ] || continue
+    case "$watchers" in *" $parent "*) continue ;; esac
+    reap "$pid" "${CAFF_PREFIX}${tag}" "no watcher"
+    if [ "$dry_run" = 0 ] && parse_tag "$tag"; then
+      log_stop "$P_SID" "$P_HOLDER" killed "$P_AT"
+    fi
+  done < <(list_caffeinates)
+
+  for pid in $(pgrep -a -f -- "$LEGACY_HEARTBEAT_PATTERN" 2>/dev/null || true); do
+    reap "$pid" heartbeat "0.2.0 heartbeat"
   done
 
-  # Heartbeats that outlived their caffeinate carry no tag, so the tab
-  # check above cannot see them.
-  for pid in $(list_orphaned_heartbeat_pids); do
-    if [ "$dry_run" = "1" ]; then
-      printf "would kill %s heartbeat\n" "$pid"
+  # Session settings files outlive nothing: each records its claude PID.
+  local f cpid
+  for f in "$STATE_DIR"/sessions/*.conf; do
+    [ -f "$f" ] || continue
+    cpid=$(conf_get "$f" claude-pid 2>/dev/null || true)
+    [[ ${cpid:-} =~ ^[1-9][0-9]*$ ]] || continue
+    pid_alive "$cpid" && continue
+    if [ "$dry_run" = 1 ]; then
+      printf 'would delete %s (claude %s exited)\n' "$f" "$cpid"
     else
-      kill "$pid" 2>/dev/null || true
-      printf "killed %s heartbeat\n" "$pid"
+      rm -f "$f"
+      printf 'deleted %s (claude %s exited)\n' "$f" "$cpid"
     fi
   done
 }
 
-cmd_claude_pid() {
-  local term_sid="" sse_port=""
+# ---------- config ----------
+
+cmd_config() {
+  local action="show" sid="" global=0 args=()
   while [ $# -gt 0 ]; do
     case "$1" in
-    --term-session-id)
-      if [ $# -lt 2 ]; then
-        printf "error: --term-session-id requires a value\n" >&2
-        return 2
-      fi
-      term_sid="$2"
-      shift 2
-      ;;
-    --sse-port)
-      if [ $# -lt 2 ]; then
-        printf "error: --sse-port requires a value\n" >&2
-        return 2
-      fi
-      sse_port="$2"
-      shift 2
-      ;;
-    --help | -h)
-      usage_claude_pid
-      return 0
-      ;;
-    *)
-      unknown_flag claude-pid "$1"
-      return 2
-      ;;
+    set | unset) action="$1" && shift ;;
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --global) global=1 && shift ;;
+    --help | -h) usage_config && return 0 ;;
+    -*) unknown_flag config "$1" ;;
+    *) args+=("$1") && shift ;;
     esac
   done
-
-  if [ -z "$term_sid" ] || [ -z "$sse_port" ]; then
-    printf "error: --term-session-id and --sse-port are required\n" >&2
-    return 2
-  fi
-
-  if ! claude_pid_for "$term_sid" "$sse_port"; then
-    return 1
-  fi
+  local file
+  case "$action" in
+  show)
+    [ "${#args[@]}" -eq 0 ] || die "config: unexpected argument: ${args[0]}" 2
+    [ -n "$sid" ] || sid="${CLAUDE_CODE_SESSION_ID:-}"
+    local name shown
+    table_reset
+    table_row SETTING VALUE FROM
+    for name in $SETTINGS; do
+      resolve_setting "$name" "" "$sid"
+      shown="$R_RAW"
+      [ "$name" != awake-max-duration ] || shown=$(fmt_duration "$R_VALUE")
+      [ "$name" != awake-min-battery ] || shown="${R_VALUE}%"
+      table_row "$name" "$shown" "$R_SOURCE"
+    done
+    table_print
+    printf '\nsession  %s\nconfig   %s\nlog      %s\n' \
+      "$([ -n "$sid" ] && session_conf "$sid" || printf -- '-')" "$CONFIG_FILE" "$LOG_FILE"
+    ;;
+  set | unset)
+    if [ "$global" = 1 ]; then
+      [ -z "$sid" ] || die "config $action: pass --session or --global, not both" 2
+      file="$CONFIG_FILE"
+    elif [ -n "$sid" ]; then
+      valid_word "$sid" || die "--session: not a session id: $sid" 2
+      file=$(session_conf "$sid")
+    else
+      die "config $action: pass --session ID or --global" 2
+    fi
+    local want=2
+    [ "$action" = set ] || want=1
+    [ "${#args[@]}" -eq "$want" ] || die "config $action: expected SETTING$([ "$want" = 2 ] && printf ' VALUE')" 2
+    is_setting "${args[0]}" || die "config: unknown setting: ${args[0]} (one of: $SETTINGS)" 2
+    if [ "$action" = set ]; then
+      setting_normalize "${args[0]}" "${args[1]}" >/dev/null ||
+        die "config set: bad value for ${args[0]}: ${args[1]}" 2
+      conf_set "$file" "${args[0]}" "${args[1]}"
+    else
+      conf_set "$file" "${args[0]}" ""
+    fi
+    if [ "$global" = 0 ] && [ -n "${CLAUDE_PID:-}" ]; then
+      conf_set "$file" claude-pid "$CLAUDE_PID"
+    fi
+    printf '%s %s in %s\n' "${args[0]}" "$([ "$action" = set ] && printf '= %s' "${args[1]}" || printf 'unset')" "$file"
+    ;;
+  esac
 }
 
 # ---------- dispatch ----------
@@ -778,6 +1515,15 @@ require_macos() {
 }
 
 main() {
+  local args=() a
+  for a in "$@"; do
+    case "$a" in
+    --no-emoji) EMOJI_FLAG=off ;;
+    --emoji) EMOJI_FLAG=on ;;
+    *) args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
   if [ $# -eq 0 ]; then
     usage
     return 0
@@ -786,38 +1532,32 @@ main() {
   " help "* | *" --help "* | *" -h "*) ;;
   *) require_macos || return 1 ;;
   esac
-  case "$1" in
-  start)
-    shift
-    cmd_start "$@"
-    ;;
-  list)
-    shift
-    cmd_list "$@"
-    ;;
+  if date -d @0 +%s >/dev/null 2>&1; then
+    DATE_STYLE=gnu
+  fi
+  NOW=$(now_epoch)
+  local cmd="$1"
+  shift
+  case "$cmd" in
+  __watch) cmd_watch "$@" ;;
+  start) cmd_start "$@" ;;
+  stop) cmd_stop "$@" ;;
+  list) cmd_list "$@" ;;
   status)
-    shift
+    resolve_emoji
+    # Column widths count characters, so measure them in UTF-8 whatever
+    # the locale; the locale only decides whether emoji show.
+    LC_ALL=en_US.UTF-8
     cmd_status "$@"
     ;;
-  kill-mine)
-    shift
-    cmd_kill_mine "$@"
-    ;;
-  kill-orphans)
-    shift
-    cmd_kill_orphans "$@"
-    ;;
-  claude-pid)
-    shift
-    cmd_claude_pid "$@"
-    ;;
-  help)
-    shift
-    cmd_help "$@"
-    ;;
+  kill-session) cmd_kill_session "$@" ;;
+  kill-mine) die "kill-mine is now kill-session" 2 ;;
+  kill-orphans) cmd_kill_orphans "$@" ;;
+  config) cmd_config "$@" ;;
+  help) cmd_help "$@" ;;
   --help | -h) usage ;;
   *)
-    printf "error: unknown command: %s (see 'claffeinate --help')\n" "$1" >&2
+    printf "error: unknown command: %s (see 'claffeinate --help')\n" "$cmd" >&2
     return 2
     ;;
   esac
