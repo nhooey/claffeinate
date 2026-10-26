@@ -22,6 +22,18 @@ fixes that. But it doesn't know when the work is done:
   `caffeinate` keeps running. With the lid open on battery, that can mean a
   flat battery by morning.
 
+Claude Code 2.1.302 runs a `caffeinate` of its own, but it doesn't close
+these gaps. It runs `caffeinate -i -t 300`, which keeps the Mac awake for 5
+minutes, and starts a new one every 4 minutes only while the session is
+busy: while a turn, a subagent, a workflow or a teammate runs. Once it stops
+being busy, the last one expires and the Mac can sleep:
+
+- **mid-build**, when the turn has ended and only a background shell is left
+- **while a permission prompt or question waits on you**
+
+It also doesn't say which session holds the Mac awake, and has no cap and no
+battery floor.
+
 ## What claffeinate does
 
 claffeinate keeps the Mac awake only while something is working, through
