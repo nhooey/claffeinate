@@ -12,7 +12,7 @@
 #
 # The tag carries everything about the hold:
 #
-#   session-<id>--holder-<holder>--claude-<pid>--max-<s>--floor-<pct>--at-<epoch>
+#   session-<id>--holder-<holder>--claude-<pid>--max-<s>--floor-<pct>--lid-<0|1>--at-<epoch>
 #
 # <holder> is `turn`, `subagent-<agent_id>`, `shell-<task_id>` or `manual`.
 # A hold ends when its holder stops it, when its claude process exits, after
@@ -21,6 +21,11 @@
 #
 # Holds are found in one `ps -A` snapshot, which, unlike macOS pgrep without
 # -a, includes the caller's ancestors.
+#
+# A hold with lid-1 also keeps the Mac awake with its lid closed. No assertion
+# can do that, so these holds share one machine-wide flag, pmset's
+# disablesleep: lid_sync sets it while any of them runs, and clears it after
+# the last. It needs root, through a sudoers rule the user installs.
 
 set -euo pipefail
 
@@ -44,6 +49,12 @@ readonly CONFIG_FILE="${CLAFFEINATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cl
 # symlink placed there, so the link goes the other way, from STATE_DIR.
 readonly LOG_FILE="${CLAFFEINATE_LOG:-$HOME/Library/Logs/claffeinate.log}"
 readonly CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Exists while claffeinate is the one that set disablesleep, so it never
+# clears a flag the user set. In STATE_DIR, not RUN_DIR: the flag can survive
+# a reboot.
+readonly LID_OWNED="${STATE_DIR}/lid-guard-owned"
+# Exists while the last attempt to set disablesleep failed.
+readonly LID_DENIED="${STATE_DIR}/lid-guard-denied"
 readonly WATCH_INTERVAL="${CLAFFEINATE_WATCH_INTERVAL:-60}"
 readonly LOG_MAX_LINES=2000
 readonly LOG_KEEP_LINES=1000
@@ -52,7 +63,7 @@ readonly NAME_WIDTH=22
 # 2.1.296 makes them.
 readonly HOLDER_WIDTH=29
 
-readonly SETTINGS="awake-max-duration awake-min-battery emoji"
+readonly SETTINGS="awake-max-duration awake-min-battery awake-lid-closed emoji"
 
 NOW=0
 DATE_STYLE=bsd
@@ -184,6 +195,7 @@ emoji_for() {
   time | cap) printf '⏳' ;;
   battery) printf '🔋' ;;
   macos) printf '💻' ;;
+  lid) printf '📕' ;;
   alive) printf '🟢' ;;
   dead) printf '🔴' ;;
   turn) printf '💬' ;;
@@ -315,6 +327,7 @@ setting_default() {
   case "$1" in
   awake-max-duration) printf '4h\n' ;;
   awake-min-battery) printf '20\n' ;;
+  awake-lid-closed) printf 'on\n' ;;
   emoji) printf 'on\n' ;;
   esac
 }
@@ -328,7 +341,7 @@ setting_normalize() {
     [[ $2 =~ ^[0-9]+$ ]] && [ "$((10#$2))" -le 100 ] || return 1
     printf '%d\n' "$((10#$2))"
     ;;
-  emoji)
+  awake-lid-closed | emoji)
     case "$2" in
     on | yes | true | 1) printf 'on\n' ;;
     off | no | false | 0) printf 'off\n' ;;
@@ -443,13 +456,14 @@ valid_word() {
   [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] && [[ $1 != *--* ]]
 }
 
-# Splits a tag into P_SID, P_HOLDER, P_CLAUDE, P_MAX, P_FLOOR, P_AT.
+# Splits a tag into P_SID, P_HOLDER, P_CLAUDE, P_MAX, P_FLOOR, P_LID, P_AT.
+# 0.3.0's tags have no lid field, and mean lid-0.
 parse_tag() {
-  local re='^session-(.+)--holder-(.+)--claude-([0-9]+)--max-([0-9]+)--floor-([0-9]+)--at-([0-9]+)$'
+  local re='^session-(.+)--holder-(.+)--claude-([0-9]+)--max-([0-9]+)--floor-([0-9]+)(--lid-([01]))?--at-([0-9]+)$'
   [[ $1 =~ $re ]] || return 1
   P_SID="${BASH_REMATCH[1]}" P_HOLDER="${BASH_REMATCH[2]}"
   P_CLAUDE="${BASH_REMATCH[3]}" P_MAX="${BASH_REMATCH[4]}"
-  P_FLOOR="${BASH_REMATCH[5]}" P_AT="${BASH_REMATCH[6]}"
+  P_FLOOR="${BASH_REMATCH[5]}" P_LID="${BASH_REMATCH[7]:-0}" P_AT="${BASH_REMATCH[8]}"
 }
 
 # The process table, read once per command by load_procs: "PID PPID
@@ -533,7 +547,13 @@ read_battery() {
     BatteryInstalled) [ "$val" = Yes ] && B_PRESENT=1 ;;
     esac
   done < <(printf '%s\n' "$out" | sed -n 's/^[[:space:]|]*"\([A-Za-z]*\)" = \([A-Za-z0-9-]*\)$/\1 \2/p')
-  [ -n "$B_PCT" ] && [ -n "$B_CUR" ] && [ -n "$B_MAX" ] && [ "$B_MAX" -gt 0 ] || B_PRESENT=0
+  # macOS 27 moved the raw capacities into the BatteryData dictionary.
+  [ -n "$B_CUR" ] || B_CUR=$(printf '%s\n' "$out" | sed -n 's/.*"AppleRawCurrentCapacity"=\([0-9]*\).*/\1/p')
+  [ -n "$B_MAX" ] || B_MAX=$(printf '%s\n' "$out" | sed -n 's/.*"AppleRawMaxCapacity"=\([0-9]*\).*/\1/p')
+  [ -n "$B_PCT" ] || B_PRESENT=0
+  # The floor only needs the percent, so unknown capacities lose the forecast
+  # and never the floor. B_MAX 0 means unknown.
+  [[ $B_CUR =~ ^[0-9]+$ ]] && [[ $B_MAX =~ ^[0-9]+$ ]] || B_CUR=0 B_MAX=0
 }
 
 # When the charge reaches floor $1 at the current drain, or nothing when
@@ -545,10 +565,84 @@ battery_end() {
     printf '%s\n' "$NOW"
     return 0
   fi
-  [ "$B_AMP" -lt 0 ] || return 0
+  [ "$B_AMP" -lt 0 ] && [ "$B_MAX" -gt 0 ] || return 0
   local left=$((B_CUR * 100 - floor * B_MAX))
   [ "$left" -gt 0 ] || left=0
   printf '%s\n' "$((NOW + left * 36 / (-B_AMP)))"
+}
+
+# ---------- the lid guard ----------
+
+# Reads the lid into L_STATE: open, closed, or none on a Mac without one; and
+# L_CAUSES_SLEEP: yes when closing it sleeps the Mac, which is no in clamshell
+# mode, on AC with an external display.
+read_lid() {
+  local out
+  out=$(ioreg -r -k AppleClamshellState -d 4 2>/dev/null || true)
+  L_STATE=none L_CAUSES_SLEEP=no
+  case "$out" in
+  *'"AppleClamshellState" = Yes'*) L_STATE=closed ;;
+  *'"AppleClamshellState" = No'*) L_STATE=open ;;
+  esac
+  case "$out" in *'"AppleClamshellCausesSleep" = Yes'*) L_CAUSES_SLEEP=yes ;; esac
+}
+
+# Prints pmset's SleepDisabled, 0 or 1.
+sleep_disabled() {
+  pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" { v = $2 } END { print (v == 1 ? 1 : 0) }'
+}
+
+# Sets disablesleep to $1 without ever asking for a password. The command is
+# spelled exactly as the rule cmd_sudoers prints.
+set_sleep_disabled() {
+  sudo -n /usr/bin/pmset -a disablesleep "$1" </dev/null >/dev/null 2>&1
+}
+
+# Counts the running caffeinates of lid holds, from PROCS. A hold's
+# caffeinate, not its watcher, so that two holds ending together each see the
+# other's already gone: each watcher waits for its caffeinate before it syncs.
+lid_holds() {
+  local pid parent tag n=0
+  while read -r pid parent tag; do
+    [ -n "$pid" ] || continue
+    if parse_tag "$tag" && [ "$P_LID" = 1 ]; then
+      n=$((n + 1))
+    fi
+  done < <(list_caffeinates)
+  printf '%d\n' "$n"
+}
+
+# With the flag just cleared, a closed lid asks for no new sleep: macOS
+# tried at the moment it closed. So sleep as closing it would have, unless
+# closing it doesn't sleep this Mac, as in clamshell mode.
+lid_sleep_if_closed() {
+  read_lid
+  [ "$L_STATE" = closed ] && [ "$L_CAUSES_SLEEP" = yes ] || return 0
+  pmset sleepnow >/dev/null 2>&1 || true
+}
+
+# Makes disablesleep match the holds: set while a lid hold runs, cleared once
+# none does. Each change to the holds syncs after it, and syncs take turns,
+# so the last one sees the final holds. Leaves alone a flag it didn't set.
+lid_sync() {
+  local lock="${RUN_DIR}locks/lid-guard"
+  mkdir -p "${RUN_DIR}locks" "$STATE_DIR" 2>/dev/null || true
+  lock_holder "$lock" || return 0
+  load_procs
+  if [ "$(lid_holds)" -gt 0 ]; then
+    if [ "$(sleep_disabled)" = 0 ]; then
+      if set_sleep_disabled 1; then
+        : >"$LID_OWNED"
+        rm -f "$LID_DENIED"
+      else
+        : >"$LID_DENIED"
+      fi
+    fi
+  elif [ -f "$LID_OWNED" ] && set_sleep_disabled 0; then
+    rm -f "$LID_OWNED" "$LID_DENIED"
+    lid_sleep_if_closed
+  fi
+  unlock_holder "$lock"
 }
 
 # ---------- the watcher ----------
@@ -560,7 +654,7 @@ cmd_watch() {
   local tag="$1" flags="$2" target="$3"
   parse_tag "$tag" || exit 2
   local sid="$P_SID" holder="$P_HOLDER" claude="$P_CLAUDE"
-  local max="$P_MAX" floor="$P_FLOOR" at="$P_AT"
+  local max="$P_MAX" floor="$P_FLOOR" lid="$P_LID" at="$P_AT"
   local cargs=("-$flags")
   [ "$target" != 0 ] && cargs+=(-w "$target")
   (exec -a "${CAFF_PREFIX}${tag}" caffeinate "${cargs[@]}") </dev/null >/dev/null 2>&1 &
@@ -606,6 +700,11 @@ cmd_watch() {
   done
   kill "$caf" 2>/dev/null
   log_stop "$sid" "$holder" "$reason" "$at"
+  if [ "$lid" = 1 ]; then
+    trap '' USR1 USR2 TERM INT
+    wait "$caf" 2>/dev/null
+    lid_sync
+  fi
   exit 0
 }
 
@@ -618,7 +717,8 @@ claffeinate -- keep your Mac awake only while Claude Code is working
 Each hold keeps the Mac awake for one thing that is working: a turn, a
 subagent or a background shell. It ends when that thing ends, when its
 claude process exits, after awake-max-duration (4h), or once the battery
-is down to awake-min-battery (20%).
+is down to awake-min-battery (20%). With awake-lid-closed (on), it holds
+with the lid closed too, once 'claffeinate sudoers' is installed.
 
 Usage:
   claffeinate <command> [options]
@@ -631,6 +731,7 @@ Commands:
   kill-session    end every hold of a session
   kill-orphans    end holds whose claude has exited, and stray processes
   config          show or change the settings
+  sudoers         print the sudoers rule that lets holds outlast a closed lid
   help [COMMAND]  show this help, or a command's
 
 Any command takes --no-emoji or --emoji.
@@ -649,12 +750,17 @@ usage_start() {
   cat <<'EOF'
 Usage: claffeinate start [--holder HOLDER] [--session ID] [--claude-pid PID]
                          [--wait-pid PID] [--awake-max-duration DURATION]
-                         [--awake-min-battery PERCENT] [--keep-display-on]
+                         [--awake-min-battery PERCENT]
+                         [--awake-lid-closed on|off] [--keep-display-on]
 
 Start a hold and print its watcher's PID. A hold keeps the Mac from
 sleeping while you're away; the display still turns off, unless you pass
 --keep-display-on. A holder has one hold: start for a holder that already
 has one prints that hold's PID and does nothing else.
+
+With awake-lid-closed on, closing the lid doesn't sleep the Mac during the
+hold, on battery too. That needs the rule 'claffeinate sudoers' prints;
+without it the hold still runs, and closing the lid sleeps the Mac.
 
 The hold ends when the first of these happens:
   - claffeinate stop, kill-session or kill-orphans ends it
@@ -675,10 +781,12 @@ Options:
   --awake-min-battery PERCENT
                       end the hold at this battery level; 0 never
                       (default 20)
+  --awake-lid-closed on|off
+                      keep the Mac awake with its lid closed (default on)
   --keep-display-on   keep the display on too
   --help              show this help
 
-See 'claffeinate config --help' for where the two limits can be set.
+See 'claffeinate config --help' for where these settings can be set.
 
 Examples:
   claffeinate start
@@ -706,9 +814,10 @@ Usage: claffeinate list [--json]
 
 List every hold on this Mac, one tab-separated row each:
 
-  PID  SESSION  HOLDER  CLAUDE_PID  alive|dead  STARTED  MAX  FLOOR
+  PID  SESSION  HOLDER  CLAUDE_PID  alive|dead  STARTED  MAX  FLOOR  LID
 
-PID is the watcher's; STARTED is in epoch seconds and MAX in seconds.
+PID is the watcher's; STARTED is in epoch seconds and MAX in seconds; LID
+is 1 for a hold that keeps the Mac awake with its lid closed.
 "dead" means its caffeinate or its claude process is gone, so
 kill-orphans would end it.
 
@@ -735,6 +844,12 @@ time, with "-" for a value that doesn't apply, so two readings line up.
   🔋 battery  when the battery reaches awake-min-battery at its current
               drain
   💻 macos    when macOS would sleep if the last hold ended now
+  📕 lid      when the last lid hold ends. state= is the lid: open, closed
+              or none. setting= is awake-lid-closed. guard= is pmset's
+              disablesleep: on, set by claffeinate; off; denied, sudo
+              refused, see 'claffeinate sudoers'; user, set by someone
+              else; stale, set by claffeinate with no hold left, which
+              kill-orphans clears
 
 Each moment is a clock time and its signed distance from now: +3h12m
 ahead, -40s behind.
@@ -771,6 +886,7 @@ End what nothing will end by itself:
   - a watcher whose caffeinate is gone
   - 0.2.0's instances and heartbeat loops
 
+clear a pmset disablesleep flag that claffeinate set and no hold needs,
 and delete the session settings files of sessions whose claude has
 exited. Prints one line for each process it stops:
 
@@ -796,16 +912,19 @@ Show each setting's value and the layer it came from, or change one.
 Settings:
   awake-max-duration  the longest one hold keeps the Mac awake (4h)
   awake-min-battery   the battery percent at which holds end; 0 never (20)
+  awake-lid-closed    on or off: holds keep the Mac awake with its lid
+                      closed; on needs 'claffeinate sudoers' (on)
   emoji               on or off, for the status output (on)
 
 Layers, strongest first:
-  flag     --awake-max-duration, --awake-min-battery, --emoji/--no-emoji
+  flag     --awake-max-duration, --awake-min-battery, --awake-lid-closed,
+           --emoji/--no-emoji
   session  $XDG_STATE_HOME/claffeinate/sessions/ID.conf, which
            /claffeinate:set writes
   env      CLAFFEINATE_AWAKE_MAX_DURATION, CLAFFEINATE_AWAKE_MIN_BATTERY,
-           CLAFFEINATE_EMOJI; Claude Code takes these from --settings,
-           then .claude/settings.json, then ~/.claude/settings.json, then
-           the environment it was started in
+           CLAFFEINATE_AWAKE_LID_CLOSED, CLAFFEINATE_EMOJI; Claude Code
+           takes these from --settings, then .claude/settings.json, then
+           ~/.claude/settings.json, then the environment it was started in
   config   $XDG_CONFIG_HOME/claffeinate/config (~/.config/claffeinate/config)
   default
 
@@ -825,6 +944,26 @@ Examples:
 EOF
 }
 
+usage_sudoers() {
+  cat <<'EOF'
+Usage: claffeinate sudoers
+
+Print the sudoers rule that lets holds keep the Mac awake with its lid
+closed. Closing the lid sleeps a Mac whatever assertions are held, so
+these holds set pmset's disablesleep, which needs root; hooks can't answer
+a password prompt. The rule allows that one setting and nothing else.
+This command changes nothing. To install the rule:
+
+  sudo visudo -f /etc/sudoers.d/claffeinate
+
+then paste the output in. Without it, holds still keep the Mac awake with
+the lid open, and 'claffeinate status' shows guard=denied.
+
+Options:
+  --help  show this help
+EOF
+}
+
 # Prints a command's help, or the overview when no command is given.
 cmd_help() {
   case "${1:-}" in
@@ -836,6 +975,7 @@ cmd_help() {
   kill-session) usage_kill_session ;;
   kill-orphans) usage_kill_orphans ;;
   config) usage_config ;;
+  sudoers) usage_sudoers ;;
   *)
     printf "error: unknown command: %s (see 'claffeinate --help')\n" "$1" >&2
     return 2
@@ -886,7 +1026,7 @@ default_session() {
 
 cmd_start() {
   local flags="i" holder="manual" sid="" claude="${CLAUDE_PID:-0}" wait_pid=""
-  local max_flag="" floor_flag=""
+  local max_flag="" floor_flag="" lid_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
     --keep-display-on) flags="di" && shift ;;
@@ -900,6 +1040,7 @@ cmd_start() {
     --wait-pid) need_value "$1" $# && wait_pid="$2" && shift 2 ;;
     --awake-max-duration) need_value "$1" $# && max_flag="$2" && shift 2 ;;
     --awake-min-battery) need_value "$1" $# && floor_flag="$2" && shift 2 ;;
+    --awake-lid-closed) need_value "$1" $# && lid_flag="$2" && shift 2 ;;
     --timeout | -t) die "--timeout is now --awake-max-duration" 2 ;;
     --help | -h) usage_start && return 0 ;;
     *) unknown_flag start "$1" ;;
@@ -918,6 +1059,9 @@ cmd_start() {
   local max="$R_VALUE"
   resolve_setting awake-min-battery "$floor_flag" "$sid"
   local floor="$R_VALUE"
+  resolve_setting awake-lid-closed "$lid_flag" "$sid"
+  local lid=0
+  [ "$R_VALUE" = off ] || lid=1
 
   command -v caffeinate >/dev/null 2>&1 || die "caffeinate not found on PATH"
   local target="${wait_pid:-$claude}"
@@ -939,7 +1083,7 @@ cmd_start() {
   fi
   local tag at
   at=$(date +%s)
-  tag="session-${sid}--holder-${holder}--claude-${claude}--max-${max}--floor-${floor}--at-${at}"
+  tag="session-${sid}--holder-${holder}--claude-${claude}--max-${max}--floor-${floor}--lid-${lid}--at-${at}"
   (exec -a "${WATCH_PREFIX}${tag}" "$BASH" "$SELF" __watch "$tag" "$flags" "$target") \
     </dev/null >/dev/null 2>&1 &
   local pid=$!
@@ -953,6 +1097,13 @@ cmd_start() {
     load_procs
   done
   unlock_holder "$lock"
+  # A hold without the lid can still find a flag left by a crash to clear.
+  if [ "$lid" = 1 ] || [ -f "$LID_OWNED" ]; then
+    lid_sync
+  fi
+  if [ "$lid" = 1 ] && [ -f "$LID_DENIED" ]; then
+    warn "closing the lid will sleep the Mac: sudo refused pmset disablesleep; see 'claffeinate sudoers --help'"
+  fi
   printf '%s\n' "$pid"
 }
 
@@ -996,10 +1147,10 @@ cmd_kill_session() {
 # ---------- holds, for status and list ----------
 
 # Fills the H_* arrays with every hold, one index per watcher.
-H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_AT=() H_STATE=()
+H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_LID=() H_AT=() H_STATE=()
 collect_holds() {
   local pid tag caf state
-  H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_AT=() H_STATE=()
+  H_PID=() H_CAF=() H_SID=() H_HOLDER=() H_CLAUDE=() H_MAX=() H_FLOOR=() H_LID=() H_AT=() H_STATE=()
   load_procs
   while read -r pid tag; do
     [ -n "$pid" ] || continue
@@ -1010,7 +1161,7 @@ collect_holds() {
       state=dead
     fi
     H_PID+=("$pid") H_CAF+=("${caf:-0}") H_SID+=("$P_SID") H_HOLDER+=("$P_HOLDER")
-    H_CLAUDE+=("$P_CLAUDE") H_MAX+=("$P_MAX") H_FLOOR+=("$P_FLOOR") H_AT+=("$P_AT")
+    H_CLAUDE+=("$P_CLAUDE") H_MAX+=("$P_MAX") H_FLOOR+=("$P_FLOOR") H_LID+=("$P_LID") H_AT+=("$P_AT")
     H_STATE+=("$state")
   done < <(list_watchers)
 }
@@ -1028,16 +1179,17 @@ cmd_list() {
   collect_holds
   {
     for ((i = 0; i < ${#H_PID[@]}; i++)); do
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${H_PID[$i]}" "${H_SID[$i]}" \
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${H_PID[$i]}" "${H_SID[$i]}" \
         "${H_HOLDER[$i]}" "${H_CLAUDE[$i]}" "${H_STATE[$i]}" "${H_AT[$i]}" \
-        "${H_MAX[$i]}" "${H_FLOOR[$i]}"
+        "${H_MAX[$i]}" "${H_FLOOR[$i]}" "${H_LID[$i]}"
     done
   } | if [ "$json" = 1 ]; then
     jq -Rn '[inputs | select(length > 0) | split("\t") | {
       pid: (.[0] | tonumber), session: .[1], holder: .[2],
       claude_pid: (if .[3] == "0" then null else (.[3] | tonumber) end),
       alive: (.[4] == "alive"), started: (.[5] | tonumber),
-      max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber)
+      max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber),
+      lid_closed: (.[8] == "1")
     }]'
   else
     cat
@@ -1081,8 +1233,8 @@ short_name() {
 # source's displaysleep and sleep, in minutes; 0 is never), M_INPUT (the
 # epoch of the last keyboard, mouse or trackpad input) and M_OTHER (other
 # processes holding a sleep or display assertion, as NAME:PID,
-# comma-joined). Our own
-# caffeinate PIDs are in $1, space-separated.
+# comma-joined) and M_SLEEP_DISABLED, and reads the lid. Our own caffeinate
+# PIDs are in $1, space-separated.
 macos_sleep_model() {
   local ours=" ${1:-} " batt section idle_ns
   batt=$(pmset -g batt 2>/dev/null | head -n 1 || true)
@@ -1116,13 +1268,34 @@ macos_sleep_model() {
       if (!(pid in seen)) { seen[pid] = 1; out = out (out == "" ? "" : ",") name ":" pid }
     }
     END { print out }' || true)
+  read_lid
+  M_SLEEP_DISABLED=$(sleep_disabled)
+}
+
+# What disablesleep is doing, with $1 lid holds running: on, off, denied,
+# user or stale. See usage_status.
+lid_guard() {
+  if [ "$M_SLEEP_DISABLED" = 1 ]; then
+    if [ ! -f "$LID_OWNED" ]; then
+      printf 'user\n'
+    elif [ "$1" -gt 0 ]; then
+      printf 'on\n'
+    else
+      printf 'stale\n'
+    fi
+  elif [ -f "$LID_DENIED" ] && [ "$DEF_LID" = on ]; then
+    printf 'denied\n'
+  else
+    printf 'off\n'
+  fi
 }
 
 # When macOS would sleep if the last hold ended at $1, or nothing while
-# something prevents it.
+# something prevents it. A guard no hold owns outlives the last hold.
 macos_sleep_at() {
   local t="$1"
   [ -z "$M_OTHER" ] && [ "$M_DISPLAY" -gt 0 ] && [ "$M_SLEEP" -gt 0 ] || return 0
+  [ "$F_GUARD" != user ] && [ "$F_GUARD" != stale ] || return 0
   local a=$((M_INPUT + M_DISPLAY * 60)) b=$((M_INPUT + M_SLEEP * 60))
   [ "$a" -gt "$t" ] && t=$a
   [ "$b" -gt "$t" ] && t=$b
@@ -1167,6 +1340,18 @@ forecast() {
   done
   [ "$n" -gt 0 ] && F_BATTERY=$(battery_end "$F_FLOOR")
 
+  # lid: the latest end among the holds that outlast a closed lid
+  local lids=0
+  F_LID=""
+  for ((i = 0; i < n; i++)); do
+    [ "${H_LID[$i]}" = 1 ] || continue
+    lids=$((lids + 1))
+    if [ -z "$F_LID" ] || [ "${H_END[$i]}" -gt "$F_LID" ]; then
+      F_LID=${H_END[$i]}
+    fi
+  done
+  F_GUARD=$(lid_guard "$lids")
+
   F_MACOS=$(macos_sleep_at "$NOW")
   if [ "$n" -gt 0 ]; then
     F_SLEEP=$(macos_sleep_at "$F_END")
@@ -1195,7 +1380,7 @@ battery_details() {
   fi
   local floor="floor=${F_FLOOR}%" rate="rate=0"
   [ "$F_FLOOR" -gt 0 ] || floor="floor=off"
-  if [ "$B_AMP" -lt 0 ]; then
+  if [ "$B_AMP" -lt 0 ] && [ "$B_MAX" -gt 0 ]; then
     rate="rate=-$(((-B_AMP) * 100 / B_MAX))%/h"
   fi
   printf 'now=%s%% %s %s\n' "$B_PCT" "$floor" "$rate"
@@ -1226,6 +1411,8 @@ print_status_text() {
   table_row "$(marked battery battery)" "${c[0]}" "${c[1]}" "$(battery_details)"
   IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_MACOS")"
   table_row "$(marked macos macos)" "${c[0]}" "${c[1]}" "$(macos_details)"
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_LID")"
+  table_row "$(marked lid lid)" "${c[0]}" "${c[1]}" "state=$L_STATE setting=$DEF_LID guard=$F_GUARD"
   table_print
 
   printf '\n'
@@ -1282,6 +1469,9 @@ How macOS decides to sleep, on this Mac now ($M_SOURCE power):
 - Each hold also ends when its claude process exits, after its cap
   (awake-max-duration), or at its battery floor (awake-min-battery), on
   AC power too: the watcher checks every $(fmt_duration "$WATCH_INTERVAL").
+- A hold doesn't stop the lid sleeping the Mac: that takes pmset's
+  disablesleep, which holds with awake-lid-closed set while they run,
+  guard=$F_GUARD. Once the last ends, a closed lid sleeps the Mac at once.
 EOF
 }
 
@@ -1306,11 +1496,12 @@ print_status_json() {
       --arg name "$(session_name "${H_SID[$i]}")" --arg holder "${H_HOLDER[$i]}" \
       --arg claude "${H_CLAUDE[$i]}" --arg state "${H_STATE[$i]}" \
       --arg at "${H_AT[$i]}" --arg max "${H_MAX[$i]}" --arg floor "${H_FLOOR[$i]}" \
-      --arg end "${H_END[$i]}" --arg by "${H_BY[$i]}" -n '$h + [{
+      --arg lid "${H_LID[$i]}" --arg end "${H_END[$i]}" --arg by "${H_BY[$i]}" -n '$h + [{
         pid: ($pid | tonumber), session: $sid, name: (if $name == "" then null else $name end),
         holder: $holder, claude_pid: (if $claude == "0" then null else ($claude | tonumber) end),
         alive: ($state == "alive"), started: ($at | tonumber), max_seconds: ($max | tonumber),
-        min_battery: ($floor | tonumber), ends: ($end | tonumber), ends_by: $by }]')
+        min_battery: ($floor | tonumber), lid_closed: ($lid == "1"),
+        ends: ($end | tonumber), ends_by: $by }]')
   done
   local sid holder reason ran start stop
   while read -r _ sid holder reason ran start stop; do
@@ -1336,6 +1527,8 @@ print_status_json() {
     --argjson battery "$(json_moment "$F_BATTERY")" --argjson bat "$bat" \
     --argjson macos "$(json_moment "$F_MACOS")" --argjson input "$M_INPUT" \
     --argjson display "$M_DISPLAY" --argjson sl "$M_SLEEP" --arg other "$M_OTHER" \
+    --argjson lid "$(json_moment "$F_LID")" --arg lid_state "$L_STATE" \
+    --arg lid_setting "$DEF_LID" --arg lid_guard "$F_GUARD" \
     --argjson holds "$holds" --argjson stops "$stopped" '{
       now: $now, power: $source,
       sleep: ($sleep + {by: $by}),
@@ -1343,6 +1536,7 @@ print_status_json() {
       battery: ($battery + {state: $bat}),
       macos: ($macos + {last_input: $input, displaysleep_minutes: $display,
         sleep_minutes: $sl, other: (if $other == "" then [] else ($other | split(",")) end)}),
+      lid: ($lid + {state: $lid_state, setting: $lid_setting, guard: $lid_guard}),
       holds: $holds, stops: $stops }'
 }
 
@@ -1364,6 +1558,8 @@ cmd_status() {
   DEF_MAX="$R_VALUE"
   resolve_setting awake-min-battery "" "$sid" 2>/dev/null
   DEF_FLOOR="$R_VALUE"
+  resolve_setting awake-lid-closed "" "$sid" 2>/dev/null
+  DEF_LID="$R_VALUE"
   collect_holds
   forecast
   if [ "$json" = 1 ]; then
@@ -1425,6 +1621,18 @@ cmd_kill_orphans() {
   for pid in $(pgrep -a -f -- "$LEGACY_HEARTBEAT_PATTERN" 2>/dev/null || true); do
     reap "$pid" heartbeat "0.2.0 heartbeat"
   done
+
+  # Watchers sync by themselves, but a caffeinate without one can't; the
+  # ones just reaped take a moment to leave the process table.
+  if [ -f "$LID_OWNED" ]; then
+    if [ "$dry_run" = 1 ]; then
+      [ "$(lid_holds)" -gt 0 ] || printf 'would clear pmset disablesleep\n'
+    else
+      sleep 0.2
+      lid_sync
+      [ -f "$LID_OWNED" ] || printf 'cleared pmset disablesleep\n'
+    fi
+  fi
 
   # Session settings files outlive nothing: each records its claude PID.
   local f cpid
@@ -1504,6 +1712,18 @@ cmd_config() {
   esac
 }
 
+cmd_sudoers() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --help | -h) usage_sudoers && return 0 ;;
+    *) unknown_flag sudoers "$1" ;;
+    esac
+  done
+  printf '# Lets claffeinate holds keep this Mac awake with its lid closed.\n'
+  printf '%s ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1\n' \
+    "$(id -un)"
+}
+
 # ---------- dispatch ----------
 
 # Every command drives caffeinate(1), so anything but help fails early and
@@ -1554,6 +1774,7 @@ main() {
   kill-mine) die "kill-mine is now kill-session" 2 ;;
   kill-orphans) cmd_kill_orphans "$@" ;;
   config) cmd_config "$@" ;;
+  sudoers) cmd_sudoers "$@" ;;
   help) cmd_help "$@" ;;
   --help | -h) usage ;;
   *)

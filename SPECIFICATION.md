@@ -41,12 +41,13 @@ caffeinate--claffeinate--<tag>    caffeinate -<flags> [-w <target>]
 Both names are set with `exec -a`. The tag:
 
 ```text
-session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--at-<epoch>
+session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--lid-<0|1>--at-<epoch>
 ```
 
 - `<sid>` and `<holder>` match `^[A-Za-z0-9_.-]+$` and never contain `--`.
 - `claude-0` means no claude process to watch; `floor-0` means no battery
-  floor.
+  floor; `lid-1` means the hold takes part in the lid guard. A tag without
+  `--lid-` is 0.3.0's, and means `lid-0`.
 - The settings in force at `start` are in the tag, so a later change never
   moves a running hold.
 - A watcher is a process whose `argv[0]` starts with `claffeinate-watch--`
@@ -72,14 +73,42 @@ session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--at
      lesser of the interval (`$CLAFFEINATE_WATCH_INTERVAL`, default 60) and
      the time left to the cap, and `wait` on the `caffeinate`: it returns
      when the `caffeinate` exits or a trapped signal arrives
-3. Kill the `caffeinate`, write the stop log line, exit 0.
+3. Kill the `caffeinate`, write the stop log line. With `lid-1`, wait for
+   the `caffeinate` to exit, then run `lid_sync`. Exit 0.
+
+### The lid guard (`lid_sync`)
+
+A `PreventUserIdleSystemSleep` assertion doesn't stop lid-close sleep; only
+`pmset -a disablesleep 1` does, which is machine-wide, needs root, and has no
+owner. `lid_sync`, under the lock `$RUN_DIR/locks/lid-guard`:
+
+- Counts the running tagged `caffeinate`s with `lid-1`. It counts these, not
+  watchers, because a watcher waits for its `caffeinate` before it syncs, so
+  of two holds ending together the later sync sees neither.
+- With any, and `SleepDisabled` 0 in `pmset -g`: runs
+  `sudo -n /usr/bin/pmset -a disablesleep 1`. On success it creates
+  `$STATE_DIR/lid-guard-owned` and removes `lid-guard-denied`; on failure it
+  creates `lid-guard-denied`. A flag already set is left as it is, unowned.
+- With none, and `lid-guard-owned` present: runs
+  `sudo -n /usr/bin/pmset -a disablesleep 0`, removes both markers, and runs
+  `pmset sleepnow` if `AppleClamshellState` and `AppleClamshellCausesSleep`
+  are both `Yes` in `ioreg -r -k AppleClamshellState -d 4`. macOS asks for lid
+  sleep when the lid closes, so nothing else would sleep it.
+- With none, and no marker: does nothing, so it never clears a flag it
+  didn't set.
+
+`start` syncs after its hold is up, when the hold has `lid-1` or the marker
+exists, and warns on stderr if `lid-guard-denied` exists. `kill-orphans`
+syncs when the marker exists. Every change to the holds syncs after it, so
+the last sync sees the final holds. The marker is in `$STATE_DIR`, since
+`SleepDisabled` can outlive a reboot.
 
 ## CLI surface
 
 ```
 claffeinate start [--holder H] [--session ID] [--claude-pid PID] [--wait-pid PID]
                   [--awake-max-duration DURATION] [--awake-min-battery PERCENT]
-                  [--keep-display-on]
+                  [--awake-lid-closed on|off] [--keep-display-on]
 claffeinate stop [--holder H] [--session ID]
 claffeinate status [--explain] [--stops N] [--json|-j]
 claffeinate list [--json|-j]
@@ -88,6 +117,7 @@ claffeinate kill-orphans [--dry-run|-n]
 claffeinate config [--session ID]
 claffeinate config set (--session ID | --global) SETTING VALUE
 claffeinate config unset (--session ID | --global) SETTING
+claffeinate sudoers
 claffeinate help [COMMAND]
 ```
 
@@ -101,7 +131,7 @@ An unknown flag exits 2 naming `claffeinate COMMAND --help`.
 | `stop`         | Send `USR1` to the holder's watcher. Exit 3 if none.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `kill-session` | Send `TERM` to every watcher of the session. Exit 3 if none.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `kill-orphans` | Stop: a watcher whose claude PID is gone; a watcher with no `caffeinate` child, once older than 5 s; a tagged `caffeinate` whose parent isn't a watcher, logged as `killed`; a 0.2.0 heartbeat loop. Delete a session file whose `claude-pid` is gone. Print `killed PID NAME (WHY)` or `deleted FILE (WHY)`; `--dry-run` prints `would …` and changes nothing.                                                                                                                                                    |
-| `list`         | `PID SESSION HOLDER CLAUDE_PID alive\|dead STARTED MAX FLOOR`, tab-separated. `dead`: no `caffeinate`, or the claude PID is gone.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `list`         | `PID SESSION HOLDER CLAUDE_PID alive\|dead STARTED MAX FLOOR LID`, tab-separated. `dead`: no `caffeinate`, or the claude PID is gone.                                                                                                                                                                                                                                                                                                                                                                                  |
 | `status`       | Below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `config`       | Each setting's value and layer, then the session file, config file and log paths. `set` validates the value; `set`/`unset` on a session also record `claude-pid = $CLAUDE_PID`.                                                                                                                                                                                                                                                                                                                                    |
 
@@ -110,13 +140,13 @@ order, total above 0. Battery: an integer 0–100.
 
 ## Settings
 
-`awake-max-duration` (4h), `awake-min-battery` (20), `emoji` (on). Layers,
-strongest first, in `resolve_setting`:
+`awake-max-duration` (4h), `awake-min-battery` (20), `awake-lid-closed` (on),
+`emoji` (on). Layers, strongest first, in `resolve_setting`:
 
 1. the flag
 2. `$CLAFFEINATE_STATE_DIR/sessions/<sid>.conf`
 3. `CLAFFEINATE_AWAKE_MAX_DURATION`, `CLAFFEINATE_AWAKE_MIN_BATTERY`,
-   `CLAFFEINATE_EMOJI` (Claude Code fills these from `--settings`, project
+   `CLAFFEINATE_AWAKE_LID_CLOSED`, `CLAFFEINATE_EMOJI` (Claude Code fills these from `--settings`, project
    and user `settings.json` `env`, then the launch environment)
 4. `$CLAFFEINATE_CONFIG`, default `$XDG_CONFIG_HOME/claffeinate/config`
 5. the default
@@ -159,7 +189,10 @@ file passes 2,000 lines it is cut to its last 1,000.
 - `read_battery`, from `ioreg -rn AppleSmartBattery`: `CurrentCapacity`
   (%), `AppleRawCurrentCapacity` and `AppleRawMaxCapacity` (mAh), `Amperage`
   (mA; printed unsigned, wrapped back to negative by Bash arithmetic),
-  `ExternalConnected`, `BatteryInstalled`. No battery: a desktop.
+  `ExternalConnected`, `BatteryInstalled`. No `CurrentCapacity`: a desktop.
+  macOS 27 has the two raw capacities only inside `BatteryData`. If neither
+  place has them, the floor still works, on `CurrentCapacity`, and the
+  forecast has no time.
 - `macos_sleep_model`, the only OS-specific part:
   - the power source from `pmset -g batt`
   - that source's `displaysleep` and `sleep` from `pmset -g custom` (0 is
@@ -188,6 +221,11 @@ file passes 2,000 lines it is cut to its last 1,000.
 - `macos`: `macos_sleep_at(now)`.
 - `sleep`: with holds, `macos_sleep_at(last hold's end)`, `by=` that hold's
   limit unless macOS comes later or never (`by=macos`); with none, `macos`.
+- `lid`: the latest end among the `lid-1` holds, `-` with none; details
+  `state=<open|closed|none> setting=<on|off> guard=<g>`. `guard` is `on`
+  (`SleepDisabled` 1, marker, lid holds), `stale` (1, marker, no lid holds),
+  `user` (1, no marker), `denied` (0, `lid-guard-denied`, setting on) or
+  `off`. With `user` or `stale`, `macos_sleep_at` is nothing.
 
 ### Output
 
@@ -199,6 +237,7 @@ claffeinate  <YYYY-MM-DD HH:MM>  macOS <version>  power=<AC|battery|UPS>  holds=
 ⏳ time     <clock>  <rel>  cap=<duration>
 🔋 battery  <clock>  <rel>  <battery details>
 💻 macos    <clock>  <rel>  input=<clock>(<rel>) display=<d> sleep=<d> other=<list|->
+📕 lid      <clock>  <rel>  state=<state> setting=<on|off> guard=<guard>
 
 PID  SESSION  NAME  HOLDER  CLAUDE  STATE  STARTED <clock> <rel>  ENDS <clock> <rel>  <by>
 (none)
@@ -219,12 +258,13 @@ STOPPED <clock> <rel>  SESSION  NAME  HOLDER  REASON  RAN
   else its last `ai-title`, else `-`, cut to 22 characters with `…`.
 - Stops are the log's last N lines (`--stops`, default 5), newest first.
 - `--explain` appends how macOS decides to sleep, with the live values.
-- `--json`: `now`, `power`, `sleep`, `time`, `battery`, `macos`, `holds`,
-  `stops`, every moment as `{at, in}` or `null`.
+- `--json`: `now`, `power`, `sleep`, `time`, `battery`, `macos`, `lid`,
+  `holds`, `stops`, every moment as `{at, in}` or `null`.
+- `status` never runs `sudo`.
 
 ### Emoji
 
-`emoji_for` holds every emoji: 💤 ⏳ 🔋 💻 for the forecast lines; 🟢 🔴 for
+`emoji_for` holds every emoji: 💤 ⏳ 🔋 💻 📕 for the forecast lines; 🟢 🔴 for
 `alive` and `dead`; 💬 🤖 🐚 ✋ for `turn`, `subagent`, `shell`, `manual`; ✅ ⏳
 🔋 🚪 🧹 for `ended`, `cap`, `battery`, `claude-exited`, `killed`. Each is
 one code point with `East_Asian_Width=W` and `Emoji_Presentation=Yes`: no
@@ -278,7 +318,11 @@ matches; the `Monitor` tool also has its own `tool_name`.
 Every test runs in its own directories with its own session ids and
 stand-in claude processes (`/bin/sleep` renamed `fake-claude`), with a
 1-second watch interval. Stubs for `ioreg`, `pmset` and `sw_vers` pin the
-battery, idle time, power settings and assertions. Tests that start
+battery, idle time, power settings, assertions and lid, and a `ps` stub shows
+only the run's processes. A stand-in `sudo` is first on `PATH` for every test
+and holds default to `awake-lid-closed` off, so no test reaches the real
+`pmset disablesleep`; the `ioreg` stub is too, so no hold reads the real
+battery. Tests that start
 processes skip where `/bin/sleep` or `ps` can't run, as in a sandboxed Nix
 build.
 
@@ -309,6 +353,15 @@ build.
 | `hook_noop_without_caffeinate`| silent no-op without `caffeinate`, or off Darwin                                        |
 | `hooks_json_structure`        | every event known and present, every action handled, timeouts ≥ 15 s, `PostToolUse` matches `Bash` |
 | `non_macos_error`             | off macOS, `start` exits 1 with the macOS error and `start --help` works                |
+| `lid_guard_spans_holds`       | two holds set the flag once; it stays for the one left, and the last clears it          |
+| `lid_guard_holds_end_together`| four holds killed together clear the flag                                               |
+| `lid_closed_sleeps_at_the_end`| `sleepnow` with the lid closed; not in clamshell mode                                   |
+| `lid_setting`                 | on by default; the flag and session file beat the variable; off never calls `sudo`; a bad value fails |
+| `lid_leaves_a_flag_it_did_not_set` | a flag already set is neither cleared nor claimed; `guard=user`                    |
+| `lid_without_the_rule`        | a refused `sudo` keeps the hold, warns, shows `guard=denied`; a later hold recovers     |
+| `lid_stale_flag_cleared`      | `guard=stale`; `kill-orphans` clears it, `--dry-run` only says so                       |
+| `battery_capacities_move`     | capacities inside `BatteryData` or missing: the percent shows, and the floor ends a hold |
+| `sudoers_rule`                | the rule printed matches the command the script runs                                    |
 
 ## Out of scope
 

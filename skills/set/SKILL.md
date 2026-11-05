@@ -13,6 +13,9 @@ The settings are:
   `8h` or `90m` (default `4h`)
 - `awake-min-battery`: the battery percent at which holds end; `0` never
   (default `20`)
+- `awake-lid-closed`: `on` or `off`, whether holds keep the Mac awake with
+  its lid closed (default `on`; `on` needs the rule `claffeinate sudoers`
+  prints)
 - `emoji`: `on` or `off`, for the status output (default `on`)
 
 Run, with the Bash tool:
