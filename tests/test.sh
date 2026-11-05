@@ -8,7 +8,9 @@
 # Every test runs in its own sandbox of directories (run, state, log,
 # config, a fake ~/.claude) and its own session ids, with a fake claude
 # process to watch, so the user's real holds are never touched. Watchers
-# check every second instead of every minute.
+# check every second instead of every minute. A stand-in sudo comes first on
+# PATH, and holds default to awake-lid-closed off, so no test can reach the
+# real pmset disablesleep.
 
 set -uo pipefail
 
@@ -33,11 +35,30 @@ export CLAFFEINATE_CONFIG="${BASE}/config"
 export CLAFFEINATE_WATCH_INTERVAL=1
 export CLAUDE_CONFIG_DIR="${BASE}/claude"
 export LANG=en_US.UTF-8
+export CLAFFEINATE_AWAKE_LID_CLOSED=off
 unset LC_ALL LC_CTYPE CLAFFEINATE_NOW CLAFFEINATE_AWAKE_MAX_DURATION \
   CLAFFEINATE_AWAKE_MIN_BATTERY CLAFFEINATE_EMOJI CLAUDE_CODE_SESSION_ID CLAUDE_PID
 mkdir -p "${BASE}/claude/projects/-test" "${BASE}/logs"
+
+# The stand-in sudo: it keeps disablesleep in a file, which the pmset stub
+# reads, and logs each call. STUB_SUDO=deny refuses, as sudo -n does without
+# a rule.
+export STUB_LID_DIR="${BASE}/lid"
+mkdir -p "$STUB_LID_DIR" "${BASE}/sudo-stub"
+cat >"${BASE}/sudo-stub/sudo" <<'EOF'
+#!/usr/bin/env bash
+[ "${STUB_SUDO:-allow}" = allow ] || exit 1
+args="$*"
+printf 'sudo %s\n' "$args" >>"${STUB_LID_DIR}/calls"
+case "$args" in
+"-n /usr/bin/pmset -a disablesleep "[01]) printf '%s\n' "${args##* }" >"${STUB_LID_DIR}/flag" ;;
+*) exit 1 ;;
+esac
+EOF
+chmod +x "${BASE}/sudo-stub/sudo"
+PATH="${BASE}/sudo-stub:$PATH"
 REAL_PATH="$PATH"
-RUN="t$$"
+export RUN="t$$"
 
 FAILS=0
 PASSES=0
@@ -129,18 +150,27 @@ case " $* " in
   cat <<OUT
       "CurrentCapacity" = ${STUB_PCT:-64}
       "Amperage" = ${STUB_AMP:-18446744073709551066}
-      "AppleRawCurrentCapacity" = ${STUB_CUR:-3200}
       "ExternalConnected" = ${STUB_EXT:-No}
       "BatteryInstalled" = Yes
-      "AppleRawMaxCapacity" = ${STUB_MAX:-5000}
 OUT
+  # STUB_RAW: top, as up to macOS 15; nested, as macOS 27; none.
+  case "${STUB_RAW:-top}" in
+  top) printf '      "AppleRawCurrentCapacity" = %s\n      "AppleRawMaxCapacity" = %s\n' "${STUB_CUR:-3200}" "${STUB_MAX:-5000}" ;;
+  nested) printf '      "BatteryData" = {"AppleRawMaxCapacity"=%s,"AppleRawCurrentCapacity"=%s,"AbsoluteCapacity"=0}\n' "${STUB_MAX:-5000}" "${STUB_CUR:-3200}" ;;
+  esac
   ;;
 *IOHIDSystem*) printf '    | |     "HIDIdleTime" = %s\n' "${STUB_IDLE_NS:-40000000000}" ;;
+*AppleClamshellState*)
+  printf '  |   "AppleClamshellCausesSleep" = %s\n' "${STUB_LID_SLEEPS:-Yes}"
+  printf '  |   "AppleClamshellState" = %s\n' "${STUB_LID_CLOSED:-No}"
+  ;;
 esac
 EOF
 cat >"${STUBS}/pmset" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+"-g") printf 'System-wide power settings:\n SleepDisabled\t\t%s\n' "$(cat "${STUB_LID_DIR}/flag" 2>/dev/null || echo 0)" ;;
+sleepnow) printf 'pmset sleepnow\n' >>"${STUB_LID_DIR}/calls" ;;
 "-g custom")
   printf 'Battery Power:\n displaysleep         %s\n sleep                1\n disksleep            10\n' "${STUB_DS_BATT:-5}"
   printf 'AC Power:\n displaysleep         %s\n sleep                1\n disksleep            10\n' "${STUB_DS_AC:-10}"
@@ -156,7 +186,17 @@ case "$*" in
 esac
 EOF
 printf '#!/usr/bin/env bash\necho 15.6.1\n' >"${STUBS}/sw_vers"
+# Only this run's processes, so a real lid hold on this Mac can't keep
+# disablesleep set under a test.
+cat >"${STUBS}/ps" <<'EOF'
+#!/usr/bin/env bash
+/bin/ps "$@" | grep -- "session-${RUN}"
+exit 0
+EOF
 chmod +x "${STUBS}"/*
+# For every test, stubbed or not: a hold's battery floor must never read this
+# Mac's real charge.
+cp "${STUBS}/ioreg" "${BASE}/sudo-stub/ioreg"
 
 # Runs claffeinate with the stubs first on PATH.
 stubbed() {
@@ -186,7 +226,7 @@ test_start_and_stop() {
     return
   }
   line=$(ps -A -ww -o ppid=,command= | awk -v p="$pid" '$1 == p && $2 ~ /^caffeinate--claffeinate--/')
-  if [[ $line != *" caffeinate--claffeinate--session-${sid}--holder-turn--claude-${claude}--max-14400--floor-20--at-"*" -i -w ${claude}" ]]; then
+  if [[ $line != *" caffeinate--claffeinate--session-${sid}--holder-turn--claude-${claude}--max-14400--floor-20--lid-0--at-"*" -i -w ${claude}" ]]; then
     fail start_and_stop "watcher $pid has no caffeinate -i -w $claude named for its tag: '$line'"
     return
   fi
@@ -572,7 +612,7 @@ test_start_rejects_bad_values() {
 # ---------------------------------------------------------------------------
 test_per_command_help() {
   local cmd out via_help rc
-  for cmd in start stop list status kill-session kill-orphans config; do
+  for cmd in start stop list status kill-session kill-orphans config sudoers; do
     out=$("${CLAFF[@]}" "$cmd" --help 2>&1)
     rc=$?
     if [ "$rc" != "0" ] || [[ $out != "Usage: claffeinate $cmd"* ]]; then
@@ -688,6 +728,7 @@ claffeinate  2026-10-16 15:30  macOS 15.6.1  power=battery  holds=0
 ⏳ time     -      -       cap=4h
 🔋 battery  -      -       now=64% floor=20% rate=-11%/h
 💻 macos    15:34  +4m     input=15:29(-40s) display=5m sleep=1m other=-
+📕 lid      -      -       state=open setting=off guard=off
 
 PID    SESSION   NAME                    HOLDER                         CLAUDE  STATE     STARTED          ENDS
 (none)
@@ -987,6 +1028,280 @@ test_non_macos_error() {
 }
 
 # ---------------------------------------------------------------------------
+# The lid guard, against the stand-in sudo and the stubs
+# ---------------------------------------------------------------------------
+
+# Runs claffeinate with holds that outlast a closed lid.
+lid_on() {
+  CLAFFEINATE_AWAKE_LID_CLOSED=on stubbed "$@"
+}
+
+# Starts a test with disablesleep clear and no record of it.
+lid_reset() {
+  rm -f "${STUB_LID_DIR}/flag" "${STUB_LID_DIR}/calls" \
+    "${CLAFFEINATE_STATE_DIR}/lid-guard-owned" "${CLAFFEINATE_STATE_DIR}/lid-guard-denied"
+}
+
+lid_flag() {
+  cat "${STUB_LID_DIR}/flag" 2>/dev/null || printf '0\n'
+}
+
+lid_calls() {
+  cat "${STUB_LID_DIR}/calls" 2>/dev/null || true
+}
+
+# Counts the calls matching $1.
+lid_count() {
+  lid_calls | grep -c -- "$1" || true
+}
+
+# Waits up to 5 seconds for disablesleep to read $1.
+lid_wait_flag() {
+  local i=0
+  while [ "$(lid_flag)" != "$1" ]; do
+    i=$((i + 1))
+    [ "$i" -le 50 ] || return 1
+    sleep 0.1
+  done
+}
+
+# Waits up to 5 seconds for a call matching $1.
+lid_wait_call() {
+  local i=0
+  while [ "$(lid_count "$1")" = 0 ]; do
+    i=$((i + 1))
+    [ "$i" -le 50 ] || return 1
+    sleep 0.1
+  done
+}
+
+# Starts a fake claude, into LID_CLAUDE so a caller's subshell doesn't lose it.
+lid_claude() {
+  LID_CLAUDE=$(fake_process)
+  FAKES+=("$LID_CLAUDE")
+}
+
+test_lid_guard_spans_holds() {
+  needs_exec lid_guard_spans_holds || return
+  local sid="${RUN}-lid"
+  lid_reset
+  lid_claude
+  lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  lid_on start --holder subagent-a --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  if [ "$(lid_flag)" != 1 ] || [ "$(lid_count 'disablesleep 1')" != 1 ]; then
+    fail lid_guard_spans_holds "two holds should set the flag once: $(lid_calls)"
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  sleep 0.3
+  if [ "$(lid_flag)" != 1 ]; then
+    fail lid_guard_spans_holds "the flag should stay set for the hold still running"
+    return
+  fi
+  stubbed stop --holder subagent-a --session "$sid"
+  if ! lid_wait_flag 0; then
+    fail lid_guard_spans_holds "the last hold should clear the flag: $(lid_calls)"
+    return
+  fi
+  wait_gone "$sid" "" 5
+  if [ -e "${CLAFFEINATE_STATE_DIR}/lid-guard-owned" ] || [ "$(lid_count sleepnow)" != 0 ]; then
+    fail lid_guard_spans_holds "with the lid open: no marker left and no sleepnow: $(lid_calls)"
+    return
+  fi
+  pass lid_guard_spans_holds
+}
+
+# Holds ending together each see the other's caffeinate gone.
+test_lid_guard_holds_end_together() {
+  needs_exec lid_guard_holds_end_together || return
+  local sid="${RUN}-lidall" n
+  lid_reset
+  lid_claude
+  for n in 1 2 3 4; do
+    lid_on start --holder "subagent-$n" --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  done
+  stubbed kill-session --session "$sid"
+  if ! lid_wait_flag 0; then
+    fail lid_guard_holds_end_together "the flag stayed set: $(lid_calls)"
+    return
+  fi
+  pass lid_guard_holds_end_together
+}
+
+test_lid_closed_sleeps_at_the_end() {
+  needs_exec lid_closed_sleeps_at_the_end || return
+  local sid="${RUN}-lidslp"
+  lid_reset
+  lid_claude
+  STUB_LID_CLOSED=Yes lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  stubbed stop --holder turn --session "$sid"
+  if ! lid_wait_call sleepnow; then
+    fail lid_closed_sleeps_at_the_end "a closed lid should sleep the Mac: $(lid_calls)"
+    return
+  fi
+  # In clamshell mode a closed lid doesn't sleep the Mac, so neither may we.
+  lid_reset
+  STUB_LID_CLOSED=Yes STUB_LID_SLEEPS=No lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  stubbed stop --holder turn --session "$sid"
+  lid_wait_flag 0
+  sleep 0.3
+  if [ "$(lid_count sleepnow)" != 0 ]; then
+    fail lid_closed_sleeps_at_the_end "clamshell mode should not sleep: $(lid_calls)"
+    return
+  fi
+  pass lid_closed_sleeps_at_the_end
+}
+
+test_lid_setting() {
+  needs_exec lid_setting || return
+  local sid="${RUN}-lidset" out
+  lid_reset
+  out=$(env -u CLAFFEINATE_AWAKE_LID_CLOSED bash -c "$(declare -p CLAFF); \"\${CLAFF[@]}\" config" |
+    awk '$1 == "awake-lid-closed" { print $2, $3 }')
+  if [ "$out" != "on default" ]; then
+    fail lid_setting "the default should be on: $out"
+    return
+  fi
+  lid_claude
+  CLAFFEINATE_AWAKE_LID_CLOSED=on stubbed start --holder turn --session "$sid" \
+    --claude-pid "$LID_CLAUDE" --awake-lid-closed off >/dev/null
+  out=$(stubbed list | awk -F'\t' -v s="$sid" '$2 == s { print $9 }')
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  if [ "$out" != 0 ] || [ -n "$(lid_calls)" ]; then
+    fail lid_setting "off should beat the variable and never call sudo: LID=$out $(lid_calls)"
+    return
+  fi
+  stubbed config set --session "$sid" awake-lid-closed off >/dev/null
+  CLAFFEINATE_AWAKE_LID_CLOSED=on stubbed start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  out=$(stubbed list | awk -F'\t' -v s="$sid" '$2 == s { print $9 }')
+  stubbed stop --holder turn --session "$sid"
+  stubbed config unset --session "$sid" awake-lid-closed >/dev/null
+  wait_gone "$sid" turn 5
+  if [ "$out" != 0 ]; then
+    fail lid_setting "the session file should beat the variable: LID=$out"
+    return
+  fi
+  if stubbed start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" --awake-lid-closed maybe >/dev/null 2>&1; then
+    fail lid_setting "a bad --awake-lid-closed should exit 2"
+    return
+  fi
+  pass lid_setting
+}
+
+# A flag someone else set is theirs: never cleared, never claimed.
+test_lid_leaves_a_flag_it_did_not_set() {
+  needs_exec lid_leaves_a_flag_it_did_not_set || return
+  local sid="${RUN}-liduser" out
+  lid_reset
+  printf '1\n' >"${STUB_LID_DIR}/flag"
+  lid_claude
+  lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  out=$(lid_on status)
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  sleep 0.3
+  if [ "$(lid_flag)" != 1 ] || [ -n "$(lid_calls)" ] || [[ $out != *"guard=user"* ]]; then
+    fail lid_leaves_a_flag_it_did_not_set "calls: $(lid_calls); $out"
+    return
+  fi
+  pass lid_leaves_a_flag_it_did_not_set
+}
+
+# Without the sudoers rule a hold still holds, and says so.
+test_lid_without_the_rule() {
+  needs_exec lid_without_the_rule || return
+  local sid="${RUN}-liddeny" out err
+  lid_reset
+  lid_claude
+  export STUB_SUDO=deny
+  err=$(lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" 2>&1 >/dev/null)
+  out=$(lid_on status)
+  unset STUB_SUDO
+  if [ "$(count_holds "$sid" turn)" != 1 ] || [[ $err != *"claffeinate sudoers"* ]] || [[ $out != *"guard=denied"* ]]; then
+    fail lid_without_the_rule "holds $(count_holds "$sid" turn); stderr: $err; $out"
+    return
+  fi
+  # A rule installed later works from the next hold, and clears the record.
+  stubbed start --holder subagent-a --session "$sid" --claude-pid "$LID_CLAUDE" --awake-lid-closed on >/dev/null
+  if [ "$(lid_flag)" != 1 ] || [ -e "${CLAFFEINATE_STATE_DIR}/lid-guard-denied" ]; then
+    fail lid_without_the_rule "the next hold should set the flag: $(lid_calls)"
+    return
+  fi
+  stubbed kill-session --session "$sid"
+  lid_wait_flag 0
+  pass lid_without_the_rule
+}
+
+# A flag left by a crash: the hold that would clear it never did.
+test_lid_stale_flag_cleared() {
+  needs_exec lid_stale_flag_cleared || return
+  local out
+  lid_reset
+  mkdir -p "$CLAFFEINATE_STATE_DIR"
+  printf '1\n' >"${STUB_LID_DIR}/flag"
+  : >"${CLAFFEINATE_STATE_DIR}/lid-guard-owned"
+  out=$(lid_on status)
+  if [[ $out != *"guard=stale"* ]] || ! printf '%s\n' "$out" | grep -q '💤 sleep  *-  *-  *by=macos'; then
+    fail lid_stale_flag_cleared "status should show the stale guard, and no sleep: $out"
+    return
+  fi
+  out=$(stubbed kill-orphans --dry-run)
+  if [[ $out != *"would clear pmset disablesleep"* ]] || [ "$(lid_flag)" != 1 ]; then
+    fail lid_stale_flag_cleared "--dry-run: flag $(lid_flag), $out"
+    return
+  fi
+  out=$(stubbed kill-orphans)
+  if [[ $out != *"cleared pmset disablesleep"* ]] || [ "$(lid_flag)" != 0 ]; then
+    fail lid_stale_flag_cleared "flag $(lid_flag), $out"
+    return
+  fi
+  pass lid_stale_flag_cleared
+}
+
+# The floor is what stops a closed Mac draining, wherever macOS puts the
+# capacities: on macOS 27 they sit inside BatteryData.
+test_battery_capacities_move() {
+  needs_exec battery_capacities_move || return
+  local out sid="${RUN}-batraw"
+  out=$(STUB_RAW=nested stubbed_no_holds status | grep '^🔋 battery ')
+  if [[ $out != *"now=64% floor=20% rate=-11%/h"* ]]; then
+    fail battery_capacities_move "nested capacities: $out"
+    return
+  fi
+  out=$(STUB_RAW=none stubbed_no_holds status | grep '^🔋 battery ')
+  if [[ $out != *"now=64% floor=20% rate=0"* ]]; then
+    fail battery_capacities_move "no capacities should still show the percent: $out"
+    return
+  fi
+  if ! STUB_RAW=none stubbed_no_holds status --json | jq -e '.battery.state.percent == 64' >/dev/null; then
+    fail battery_capacities_move "--json without capacities"
+    return
+  fi
+  lid_claude
+  STUB_RAW=none STUB_PCT=15 stubbed start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  if ! wait_gone "$sid" turn 5 || [ "$(logged_reason "$sid" turn)" != battery ]; then
+    fail battery_capacities_move "the floor should end a hold without capacities"
+    return
+  fi
+  pass battery_capacities_move
+}
+
+test_sudoers_rule() {
+  local out
+  out=$("${CLAFF[@]}" sudoers)
+  # Each command the script runs has to be spelled as the rule allows it.
+  # shellcheck disable=SC2016 # the script's own text, $1 unexpanded
+  if [[ $out != *"$(id -un) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"* ]] ||
+    ! grep -q 'sudo -n /usr/bin/pmset -a disablesleep "$1"' "${ROOT_DIR}/bin/claffeinate"; then
+    fail sudoers_rule "the rule and the command differ: $out"
+    return
+  fi
+  pass sudoers_rule
+}
+
+# ---------------------------------------------------------------------------
 # Run: every test, or only those named on the command line
 # ---------------------------------------------------------------------------
 TESTS=(
@@ -1015,6 +1330,15 @@ TESTS=(
   hook_noop_without_caffeinate
   hooks_json_structure
   non_macos_error
+  lid_guard_spans_holds
+  lid_guard_holds_end_together
+  lid_closed_sleeps_at_the_end
+  lid_setting
+  lid_leaves_a_flag_it_did_not_set
+  lid_without_the_rule
+  lid_stale_flag_cleared
+  battery_capacities_move
+  sudoers_rule
 )
 for name in "${TESTS[@]}"; do
   if [ $# -eq 0 ] || [[ " $* " == *" $name "* ]]; then

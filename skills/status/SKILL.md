@@ -17,6 +17,11 @@ Then add one line on what stands out, such as:
 - a `🔴 dead` hold: tell the user `claffeinate kill-orphans` stops it. Don't
   run it yourself.
 - another app holding the Mac awake, named in `other=`
+- `guard=denied` on the `📕 lid` line: closing the lid will sleep the Mac
+  until the user installs the rule `claffeinate sudoers` prints. Don't
+  install it yourself.
+- `guard=stale`: tell the user `claffeinate kill-orphans` clears it. Don't
+  run it yourself.
 
 If the user asks how the forecast works, run `claffeinate status --explain`.
 If the command reports that it needs macOS, tell the user claffeinate only

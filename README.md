@@ -52,6 +52,10 @@ A Monitor never holds the Mac awake. Every hold also ends by itself:
 - once the battery is down to `awake-min-battery`, 20% by default, on AC
   power too, since a battery can drain while plugged in
 
+By default a hold also keeps the Mac awake **with its lid closed**, once
+you've [installed one sudoers rule](#closing-the-lid). Close the lid and
+walk away; the Mac sleeps when the work stops.
+
 `claffeinate` is one command for the whole Mac. `status` shows every hold
 of every session, and when the Mac will be allowed to sleep:
 
@@ -62,6 +66,7 @@ claffeinate  2026-10-16 15:30  macOS 15.6.1  power=battery  holds=2
 ⏳ time     19:18  +3h48m  cap=4h
 🔋 battery  19:40  +4h10m  now=64% floor=20% rate=-11%/h
 💻 macos    15:35  +5m     input=15:29(-40s) display=5m sleep=1m other=-
+📕 lid      19:18  +3h48m  state=open setting=on guard=on
 
 PID    SESSION   NAME                    HOLDER                         CLAUDE  STATE     STARTED          ENDS
 31985  0f311c94  Claffeinate             💬 turn                        55504   🟢 alive  14:42    -48m    18:42  +3h12m  ⏳ time
@@ -131,7 +136,19 @@ stops 0.2.0's instances.
 Claude Code runs a plugin's hooks and your own side by side, so hooks in
 `~/.claude/settings.json` that call `claffeinate-hook.sh` would run twice.
 
-### 2. Install the command, for your terminal
+### 2. Let holds outlast a closed lid
+
+Closing the lid sleeps a Mac whatever `caffeinate` holds, so a hold needs
+root to prevent it, and a hook can't answer a password prompt. Without this
+step holds work as before, and closing the lid sleeps the Mac. See
+[Closing the lid](#closing-the-lid).
+
+```sh
+claffeinate sudoers                              # prints the rule
+sudo visudo -f /etc/sudoers.d/claffeinate        # paste it in
+```
+
+### 3. Install the command, for your terminal
 
 The plugin runs its own copy of the script. To use `status` and
 `kill-orphans` from your shell, install the command too. With Nix:
@@ -150,7 +167,7 @@ From a checkout, link the script onto your `PATH`:
 ln -s "$PWD/bin/claffeinate" ~/bin/claffeinate
 ```
 
-### 3. Reap what bugs leave behind
+### 4. Reap what bugs leave behind
 
 Every hold ends by itself, and a hold whose `claude` crashed ends within a
 minute. `kill-orphans` is for what a bug leaves behind: a `caffeinate`
@@ -178,6 +195,7 @@ Every command has its own help: `claffeinate COMMAND --help`, or
 | `kill-session`                                  | End every hold of the session, logged as `killed`. Exits 3 if it has none. |
 | `kill-orphans [--dry-run]`                      | End what nothing else will end.                                            |
 | `config`, `config set`, `config unset`          | Show or change the settings.                                               |
+| `sudoers`                                       | Print the sudoers rule that lets holds outlast a closed lid.               |
 
 `start`, `stop` and `kill-session` act on `$CLAUDE_CODE_SESSION_ID`'s session,
 or `--session ID`; outside Claude Code the session is `none`. `start` takes
@@ -196,6 +214,7 @@ still turns off, unless you pass `--keep-display-on`.
 | `--wait-pid PID`                | ends the hold once PID exits           |
 | `--awake-max-duration DURATION` | ends it after DURATION                 |
 | `--awake-min-battery PERCENT`   | ends it once the battery is at PERCENT |
+| `--awake-lid-closed on\|off`    | keeps the Mac awake with its lid closed |
 | `--keep-display-on`             | keeps the display on too               |
 
 DURATION is a number with units, largest first: `30s`, `45m`, `1h30m`, `2d`.
@@ -214,7 +233,7 @@ readings show only what changed. Each moment is a clock time beside its
 signed distance from now: `+3h12m` ahead, `-40s` behind, `+0s` now. A plain
 length of time, such as `cap=4h` or `RAN`, never has a sign.
 
-The four forecast lines:
+The forecast lines:
 
 | Line         | When                                                                                                               |
 | ------------ | ------------------------------------------------------------------------------------------------------------------ |
@@ -222,6 +241,7 @@ The four forecast lines:
 | ⏳ `time`    | `awake-max-duration` ends the last hold                                                                            |
 | 🔋 `battery` | the battery reaches the lowest `awake-min-battery`, at its current drain; `none` on a Mac without one              |
 | 💻 `macos`   | macOS would sleep if the last hold ended now                                                                       |
+| 📕 `lid`     | the last hold that outlasts a closed lid ends; [`guard=`](#closing-the-lid) says whether one can                   |
 
 Each hold's `ENDS` is the earlier of its own two limits. It is an upper
 bound: a hold usually ends sooner, when its holder does. `NAME` is the
@@ -242,11 +262,13 @@ UTF-8 turns them off; each column keeps its width, so nothing moves.
 | -------------------- | ------- | -------------------------------- |
 | `awake-max-duration` | `4h`    | `CLAFFEINATE_AWAKE_MAX_DURATION` |
 | `awake-min-battery`  | `20`    | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
+| `awake-lid-closed`   | `on`    | `CLAFFEINATE_AWAKE_LID_CLOSED`   |
 | `emoji`              | `on`    | `CLAFFEINATE_EMOJI`              |
 
 The strongest layer wins:
 
-1. the flag: `--awake-max-duration`, `--awake-min-battery`, `--emoji`
+1. the flag: `--awake-max-duration`, `--awake-min-battery`,
+   `--awake-lid-closed`, `--emoji`
 2. the session file, `~/.local/state/claffeinate/sessions/<session>.conf`,
    which `/claffeinate:set` writes
 3. the variable, which Claude Code takes from the `env` of `--settings`,
@@ -260,7 +282,48 @@ started with; `claffeinate config` shows each value and its layer.
 
 ```sh
 claffeinate config set --global awake-min-battery 30
+claffeinate config set --global awake-lid-closed off   # let the lid sleep the Mac
 ```
+
+### Closing the lid
+
+Apple's `IOPMLib.h` says of the assertion `caffeinate -i` takes: "The system
+may still sleep for lid close". No `caffeinate` flag changes that. What does
+is `pmset -a disablesleep 1`, the `SleepDisabled` setting, and that is a
+different kind of thing from a hold: one flag for the whole Mac, needing
+root, that nothing ends for you. So claffeinate treats it as a guard around
+the holds:
+
+- The first hold with `awake-lid-closed` on sets the flag, through
+  `sudo -n`, and the last clears it, however it ended.
+- Once the flag is cleared with the lid closed, the Mac sleeps at once with
+  `pmset sleepnow`, as closing the lid would have done. It doesn't in
+  clamshell mode, with an external display on AC, where a closed lid doesn't
+  sleep the Mac.
+- `~/.local/state/claffeinate/lid-guard-owned` records that claffeinate set
+  the flag, so it never clears a flag you set yourself.
+- If a crash leaves the flag set, the next hold or `kill-orphans` clears it.
+
+The rule from `claffeinate sudoers` allows those two commands and nothing
+else. On a Mac managed with nix-darwin, put it in `security.sudo.extraConfig`
+instead of pasting it.
+
+`status` shows the flag as `guard=`:
+
+| `guard=` | Means                                                                  |
+| -------- | ---------------------------------------------------------------------- |
+| `on`     | claffeinate set the flag: closing the lid doesn't sleep the Mac        |
+| `off`    | the flag isn't set                                                     |
+| `denied` | `sudo` refused: install the rule, or closing the lid sleeps the Mac    |
+| `user`   | something else set the flag; claffeinate leaves it, and macOS can't sleep |
+| `stale`  | claffeinate set it and no hold needs it; `kill-orphans` clears it      |
+
+> [!WARNING]
+> A Mac that stays awake with its lid closed can run hot in a bag or a
+> sleeve: it may not have the airflow it needs, and it runs until the hold
+> ends, up to `awake-max-duration`. It also runs on battery, down to
+> `awake-min-battery`; don't set that to `0` with this on. To keep the lid
+> in charge, set `awake-lid-closed` to `off`.
 
 ### Scripting with `--json`
 
@@ -297,7 +360,7 @@ followed by sleep at 12:52:40, 5 seconds after the display turned off.
 `status` reads these live: `pmset -g custom` for the settings,
 `ioreg -c IOHIDSystem`'s `HIDIdleTime` for your last input, and
 `pmset -g assertions` for other processes' assertions, named in `other=`.
-They sit in one function, `macos_sleep_model`, the only part a port to
+`status` never runs `sudo`. They sit in one function, `macos_sleep_model`, the only part a port to
 another OS would replace.
 
 ## How it works
@@ -316,7 +379,7 @@ The tag carries everything about the hold, so the process table is the
 only registry:
 
 ```
-session-<id>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--at-<epoch>
+session-<id>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--lid-<0|1>--at-<epoch>
 ```
 
 `caffeinate -w` waits on the claude process for a turn or a subagent, and
@@ -368,6 +431,10 @@ checkout. The script reads the hook's JSON payload on stdin, takes
   `tasks/<id>.output` path and `$CLAUDE_PID`, which Claude Code doesn't
   document. If they change, background shells get no hold, and nothing else
   breaks.
+- **Staying awake with the lid closed needs root.** Without the rule from
+  `claffeinate sudoers`, closing the lid sleeps the Mac, and `start` warns.
+- **The lid flag is for the whole Mac.** While any hold has it set, macOS
+  won't sleep on its own, even for holds with `awake-lid-closed` off.
 - **macOS only.** It wraps `caffeinate(1)` and reads `pmset` and `ioreg`. It
   needs Bash 3.2 or later, which macOS ships.
 
