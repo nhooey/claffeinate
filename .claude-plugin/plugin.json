@@ -1,6 +1,6 @@
 {
   "name": "claffeinate",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Keep your Mac awake while Claude Code works, and let it sleep once the work stops, even when a tab crashes. macOS only.",
   "author": {
     "name": "Neil Hooey"

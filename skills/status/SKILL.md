@@ -22,6 +22,8 @@ Then add one line on what stands out, such as:
   install it yourself.
 - `guard=stale`: tell the user `claffeinate kill-orphans` clears it. Don't
   run it yourself.
+- a pause on the `🛑 pause` line, or a `🟡 paused` hold: tell the user
+  `claffeinate resume` ends it. Don't run it yourself.
 
 If the user asks how the forecast works, run `claffeinate status --explain`.
 If the command reports that it needs macOS, tell the user claffeinate only

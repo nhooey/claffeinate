@@ -26,6 +26,10 @@
 # can do that, so these holds share one machine-wide flag, pmset's
 # disablesleep: lid_sync sets it while any of them runs, and clears it after
 # the last. It needs root, through a sudoers rule the user installs.
+#
+# A paused hold keeps its watcher and has no caffeinate, so it asserts
+# nothing. The watcher starts a new one on resume, and goes on enforcing the
+# hold's limits.
 
 set -euo pipefail
 
@@ -55,6 +59,8 @@ readonly CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 readonly LID_OWNED="${STATE_DIR}/lid-guard-owned"
 # Exists while the last attempt to set disablesleep failed.
 readonly LID_DENIED="${STATE_DIR}/lid-guard-denied"
+# One file per pause rule. In STATE_DIR, so a pause outlives a reboot.
+readonly PAUSE_DIR="${STATE_DIR}/pauses"
 readonly WATCH_INTERVAL="${CLAFFEINATE_WATCH_INTERVAL:-60}"
 readonly LOG_MAX_LINES=2000
 readonly LOG_KEEP_LINES=1000
@@ -196,7 +202,9 @@ emoji_for() {
   battery) printf '🔋' ;;
   macos) printf '💻' ;;
   lid) printf '📕' ;;
+  pause) printf '🛑' ;;
   alive) printf '🟢' ;;
+  paused) printf '🟡' ;;
   dead) printf '🔴' ;;
   turn) printf '💬' ;;
   subagent) printf '🤖' ;;
@@ -649,6 +657,69 @@ lid_sync() {
 
 # Runs one hold: starts its caffeinate, then ends it on the first limit
 # reached, and logs why.
+# ---------- pauses ----------
+
+# A rule file holds SESSION, HOLDER and UNTIL, tab-separated. SESSION is an id
+# or "*", HOLDER is a glob, and UNTIL is an epoch, or 0 for until resume.
+
+# Prints each rule still in force, and deletes the ones that have ended.
+pause_rules() {
+  local f now session holder until
+  now=$(now_epoch)
+  for f in "$PAUSE_DIR"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r session holder until <"$f" || continue
+    if [ "$until" != 0 ] && [ "$until" -le "$now" ]; then
+      rm -f "$f"
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$session" "$holder" "$until"
+  done
+}
+
+# True when a rule covers session $1's holder $2. Sets PAUSE_UNTIL to the
+# latest end among those rules, 0 if one has none.
+PAUSE_UNTIL=""
+pause_match() {
+  local session holder until matched=1
+  PAUSE_UNTIL=""
+  while IFS=$'\t' read -r session holder until; do
+    [ "$session" = '*' ] || [ "$session" = "$1" ] || continue
+    # shellcheck disable=SC2254 # the holder is a glob
+    case "$2" in
+    $holder) ;;
+    *) continue ;;
+    esac
+    matched=0
+    if [ "$until" = 0 ] || [ "$PAUSE_UNTIL" = 0 ]; then
+      PAUSE_UNTIL=0
+    elif [ "$until" -gt "${PAUSE_UNTIL:-0}" ]; then
+      PAUSE_UNTIL=$until
+    fi
+  done < <(pause_rules)
+  return "$matched"
+}
+
+# Waits up to 2 seconds for watcher $1's caffeinate.
+wait_caffeinate() {
+  local tries=0
+  load_procs
+  while [ -z "$(caffeinate_of "$1")" ] && [ "$tries" -lt 40 ]; do
+    tries=$((tries + 1))
+    sleep 0.05
+    load_procs
+  done
+}
+
+# Has every watcher read the rules now, not at its next check.
+wake_watchers() {
+  local pid tag
+  load_procs
+  while read -r pid tag; do
+    [ -z "$pid" ] || kill -USR2 "$pid" 2>/dev/null || true
+  done < <(list_watchers)
+}
+
 cmd_watch() {
   set +e
   local tag="$1" flags="$2" target="$3"
@@ -657,14 +728,29 @@ cmd_watch() {
   local max="$P_MAX" floor="$P_FLOOR" lid="$P_LID" at="$P_AT"
   local cargs=("-$flags")
   [ "$target" != 0 ] && cargs+=(-w "$target")
-  (exec -a "${CAFF_PREFIX}${tag}" caffeinate "${cargs[@]}") </dev/null >/dev/null 2>&1 &
-  local caf=$! reason="" timer="" now nap
+  local caf="" was_paused=0 reason="" timer="" now nap
   trap 'reason=ended' USR1
   trap 'reason=killed' TERM INT
   trap ':' USR2
   trap '' HUP
   while [ -z "$reason" ]; do
-    if ! kill -0 "$caf" 2>/dev/null; then
+    if pause_match "$sid" "$holder"; then
+      was_paused=1
+      if [ -n "$caf" ]; then
+        kill "$caf" 2>/dev/null
+        wait "$caf" 2>/dev/null
+        caf=""
+        [ "$lid" != 1 ] || lid_sync
+      fi
+    elif [ -z "$caf" ]; then
+      (exec -a "${CAFF_PREFIX}${tag}" caffeinate "${cargs[@]}") </dev/null >/dev/null 2>&1 &
+      caf=$!
+      if [ "$was_paused" = 1 ] && [ "$lid" = 1 ]; then
+        wait_caffeinate "$$"
+        lid_sync
+      fi
+    fi
+    if [ -n "$caf" ] && ! kill -0 "$caf" 2>/dev/null; then
       if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
         reason="claude-exited"
       else
@@ -674,6 +760,11 @@ cmd_watch() {
     fi
     if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
       reason="claude-exited"
+      break
+    fi
+    # With no caffeinate -w running, the watcher watches the target itself.
+    if [ -z "$caf" ] && [ "$target" != 0 ] && ! kill -0 "$target" 2>/dev/null; then
+      reason=ended
       break
     fi
     now=$(date +%s)
@@ -690,19 +781,27 @@ cmd_watch() {
     fi
     nap=$((at + max - now))
     [ "$nap" -gt "$WATCH_INTERVAL" ] && nap=$WATCH_INTERVAL
+    if [ -z "$caf" ] && [ "${PAUSE_UNTIL:-0}" -gt 0 ] && [ $((PAUSE_UNTIL - now)) -lt "$nap" ]; then
+      nap=$((PAUSE_UNTIL - now))
+      [ "$nap" -gt 0 ] || nap=1
+    fi
     # Waiting on caffeinate itself ends the nap the moment it exits; the
     # timer's USR2 ends it otherwise.
     (sleep "$nap" && kill -USR2 $$) </dev/null >/dev/null 2>&1 &
     timer=$!
-    wait "$caf"
+    if [ -n "$caf" ]; then
+      wait "$caf"
+    else
+      wait "$timer"
+    fi
     pkill -P "$timer" 2>/dev/null
     kill "$timer" 2>/dev/null
   done
-  kill "$caf" 2>/dev/null
+  [ -z "$caf" ] || kill "$caf" 2>/dev/null
   log_stop "$sid" "$holder" "$reason" "$at"
   if [ "$lid" = 1 ]; then
     trap '' USR1 USR2 TERM INT
-    wait "$caf" 2>/dev/null
+    [ -z "$caf" ] || wait "$caf" 2>/dev/null
     lid_sync
   fi
   exit 0
@@ -730,6 +829,8 @@ Commands:
   list            every hold, one row each
   kill-session    end every hold of a session
   kill-orphans    end holds whose claude has exited, and stray processes
+  pause           let the Mac sleep despite holds, until resume
+  resume          end a pause
   config          show or change the settings
   sudoers         print the sudoers rule that lets holds outlast a closed lid
   help [COMMAND]  show this help, or a command's
@@ -819,7 +920,7 @@ List every hold on this Mac, one row each, with these columns:
 A terminal gets aligned columns under headers and a rule. Anything else,
 such as a pipe, gets tab-separated rows with no headers.
 
-PID is the watcher's; STATE is alive or dead; STARTED is in epoch seconds
+PID is the watcher's; STATE is alive, paused or dead; STARTED is in epoch seconds
 and MAX in seconds; LID is 1 for a hold that keeps the Mac awake with its
 lid closed.
 "dead" means its caffeinate or its claude process is gone, so
@@ -854,6 +955,9 @@ time, with "-" for a value that doesn't apply, so two readings line up.
               refused, see 'claffeinate sudoers'; user, set by someone
               else; stale, set by claffeinate with no hold left, which
               kill-orphans clears
+  🛑 pause    when the last pause ends, or "-" if one runs until resume.
+              rules= lists the pauses: all, a session, a holder, or
+              SESSION/HOLDER
 
 Each moment is a clock time and its signed distance from now: +3h12m
 ahead, -40s behind.
@@ -879,6 +983,52 @@ Options:
 EOF
 }
 
+usage_pause() {
+  cat <<'EOF'
+Usage: claffeinate pause [--session ID] [--holder GLOB] [--pid PID] [--for DURATION]
+
+Let the Mac sleep despite its holds, until 'claffeinate resume'. With no
+flags, this covers every hold, including holds that start later. Each hold
+stops preventing sleep but keeps running, so resume brings it back, and its
+time limit, battery floor and claude check all go on. A pause doesn't extend
+a hold's time limit.
+
+It outlasts a reboot, and it doesn't reach assertions claffeinate doesn't
+own, such as Claude Code's own caffeinate; status lists those as other=.
+
+Options:
+  --session ID     only this session's holds
+  --holder GLOB    only these holders, such as turn or 'subagent-*'
+  --pid PID        only this hold, by the watcher PID from list; it covers
+                   its session and holder, and takes no other scope
+  --for DURATION   end by itself: 90, 30m, 1h30m
+  --help           show this help
+
+Pausing the same scope again replaces its end time.
+
+Examples:
+  claffeinate pause --for 30m
+  claffeinate pause --session "$CLAUDE_CODE_SESSION_ID" --holder 'shell-*'
+EOF
+}
+
+usage_resume() {
+  cat <<'EOF'
+Usage: claffeinate resume [--session ID] [--holder GLOB] [--pid PID]
+
+End pauses, printing one line for each. With no flags, this ends every
+pause. A scope ends the pauses within it, so 'resume --session ID' ends that
+session's pauses but not one made with no flags. Paused holds start
+preventing sleep again at once. Exits 3 if no pause matched.
+
+Options:
+  --session ID     only pauses of this session
+  --holder GLOB    only pauses made with exactly this holder or glob
+  --pid PID        only pauses of this hold's session and holder
+  --help           show this help
+EOF
+}
+
 usage_kill_orphans() {
   cat <<'EOF'
 Usage: claffeinate kill-orphans [--dry-run]
@@ -887,7 +1037,7 @@ End what nothing will end by itself:
 
   - a hold whose claude process has exited
   - a tagged caffeinate whose watcher is gone
-  - a watcher whose caffeinate is gone
+  - a watcher whose caffeinate is gone, unless it's paused
   - 0.2.0's instances and heartbeat loops
 
 clear a pmset disablesleep flag that claffeinate set and no hold needs,
@@ -978,6 +1128,8 @@ cmd_help() {
   status) usage_status ;;
   kill-session) usage_kill_session ;;
   kill-orphans) usage_kill_orphans ;;
+  pause) usage_pause ;;
+  resume) usage_resume ;;
   config) usage_config ;;
   sudoers) usage_sudoers ;;
   *)
@@ -1092,14 +1244,9 @@ cmd_start() {
     </dev/null >/dev/null 2>&1 &
   local pid=$!
   disown "$pid" 2>/dev/null || true
-  # Wait for the caffeinate, so the hold is in force when start returns.
-  local tries=0
-  load_procs
-  while [ -z "$(caffeinate_of "$pid")" ] && [ "$tries" -lt 40 ]; do
-    tries=$((tries + 1))
-    sleep 0.05
-    load_procs
-  done
+  # Wait for the caffeinate, so the hold is in force when start returns. A
+  # paused hold has none.
+  pause_match "$sid" "$holder" || wait_caffeinate "$pid"
   unlock_holder "$lock"
   # A hold without the lid can still find a flag left by a crash to clear.
   if [ "$lid" = 1 ] || [ -f "$LID_OWNED" ]; then
@@ -1148,6 +1295,94 @@ cmd_kill_session() {
   kill -TERM $pids 2>/dev/null || true
 }
 
+# Sets SCOPE_SESSION and SCOPE_HOLDER, "*" for any, from the values of
+# --session, --holder and --pid.
+SCOPE_SESSION="*" SCOPE_HOLDER="*"
+resolve_scope() {
+  local sid="$1" holder="$2" pid="$3" tag
+  if [ -n "$pid" ]; then
+    [ -z "$sid$holder" ] || die "--pid goes alone, without --session or --holder" 2
+    [[ $pid =~ ^[0-9]+$ ]] || die "--pid: not a PID: $pid" 2
+    load_procs
+    tag=$(list_watchers | awk -v p="$pid" '$1 == p { print $2 }')
+    if [ -z "$tag" ] || ! parse_tag "$tag"; then
+      die "no hold has watcher PID $pid; see 'claffeinate list'" 3
+    fi
+    sid=$P_SID holder=$P_HOLDER
+  fi
+  [ -z "$sid" ] || valid_word "$sid" || die "--session: not a session id: $sid" 2
+  [ -z "$holder" ] || [[ $holder =~ ^[A-Za-z0-9_.*?-]+$ ]] || die "--holder: not a holder or glob: $holder" 2
+  SCOPE_SESSION=${sid:-*} SCOPE_HOLDER=${holder:-*}
+}
+
+# The scope as a word: all, a session, a holder, or SESSION/HOLDER.
+scope_name() {
+  local session="$1" holder="$2"
+  if [ "$session" = '*' ] && [ "$holder" = '*' ]; then
+    printf 'all\n'
+  elif [ "$session" = '*' ]; then
+    printf '%s\n' "$holder"
+  elif [ "$holder" = '*' ]; then
+    printf '%s\n' "${session:0:8}"
+  else
+    printf '%s/%s\n' "${session:0:8}" "$holder"
+  fi
+}
+
+cmd_pause() {
+  local sid="" holder="" pid="" for_flag="" until=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
+    --pid) need_value "$1" $# && pid="$2" && shift 2 ;;
+    --for) need_value "$1" $# && for_flag="$2" && shift 2 ;;
+    --help | -h) usage_pause && return 0 ;;
+    *) unknown_flag pause "$1" ;;
+    esac
+  done
+  resolve_scope "$sid" "$holder" "$pid"
+  if [ -n "$for_flag" ]; then
+    local seconds
+    seconds=$(duration_to_seconds "$for_flag") || die "--for: not a duration: $for_flag" 2
+    until=$(($(now_epoch) + seconds))
+  fi
+  local key
+  key=$(printf '%s\t%s' "$SCOPE_SESSION" "$SCOPE_HOLDER" | cksum | awk '{ print $1 }')
+  mkdir -p "$PAUSE_DIR"
+  printf '%s\t%s\t%s\n' "$SCOPE_SESSION" "$SCOPE_HOLDER" "$until" >"${PAUSE_DIR}/.${key}.$$"
+  mv -f "${PAUSE_DIR}/.${key}.$$" "${PAUSE_DIR}/${key}"
+  wake_watchers
+  printf 'paused %s%s\n' "$(scope_name "$SCOPE_SESSION" "$SCOPE_HOLDER")" \
+    "${for_flag:+ for $for_flag}"
+}
+
+cmd_resume() {
+  local sid="" holder="" pid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
+    --pid) need_value "$1" $# && pid="$2" && shift 2 ;;
+    --help | -h) usage_resume && return 0 ;;
+    *) unknown_flag resume "$1" ;;
+    esac
+  done
+  resolve_scope "$sid" "$holder" "$pid"
+  local f session rule_holder until removed=0
+  for f in "$PAUSE_DIR"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r session rule_holder until <"$f" || continue
+    [ "$SCOPE_SESSION" = '*' ] || [ "$session" = "$SCOPE_SESSION" ] || continue
+    [ "$SCOPE_HOLDER" = '*' ] || [ "$rule_holder" = "$SCOPE_HOLDER" ] || continue
+    rm -f "$f"
+    removed=$((removed + 1))
+    printf 'resumed %s\n' "$(scope_name "$session" "$rule_holder")"
+  done
+  [ "$removed" -gt 0 ] || return 3
+  wake_watchers
+}
+
 # ---------- holds, for status and list ----------
 
 # Fills the H_* arrays with every hold, one index per watcher.
@@ -1161,8 +1396,13 @@ collect_holds() {
     parse_tag "$tag" || continue
     caf=$(caffeinate_of "$pid")
     state=alive
-    if [ -z "$caf" ] || { [ "$P_CLAUDE" != 0 ] && ! pid_alive "$P_CLAUDE"; }; then
+    if [ "$P_CLAUDE" != 0 ] && ! pid_alive "$P_CLAUDE"; then
       state=dead
+    elif [ -z "$caf" ]; then
+      state=dead
+      if pause_match "$P_SID" "$P_HOLDER"; then
+        state=paused
+      fi
     fi
     H_PID+=("$pid") H_CAF+=("${caf:-0}") H_SID+=("$P_SID") H_HOLDER+=("$P_HOLDER")
     H_CLAUDE+=("$P_CLAUDE") H_MAX+=("$P_MAX") H_FLOOR+=("$P_FLOOR") H_LID+=("$P_LID") H_AT+=("$P_AT")
@@ -1191,7 +1431,7 @@ cmd_list() {
     jq -Rn '[inputs | select(length > 0) | split("\t") | {
       pid: (.[0] | tonumber), session: .[1], holder: .[2],
       claude_pid: (if .[3] == "0" then null else (.[3] | tonumber) end),
-      alive: (.[4] == "alive"), started: (.[5] | tonumber),
+      alive: (.[4] != "dead"), paused: (.[4] == "paused"), started: (.[5] | tonumber),
       max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber),
       lid_closed: (.[8] == "1")
     }]'
@@ -1370,6 +1610,7 @@ forecast() {
     else
       H_END+=("$end") H_BY+=(time)
     fi
+    [ "${H_STATE[$i]}" != paused ] || continue
     if [ -z "$F_END" ] || [ "${H_END[$i]}" -gt "$F_END" ]; then
       F_END=${H_END[$i]} F_BY=${H_BY[$i]}
     fi
@@ -1381,6 +1622,7 @@ forecast() {
   F_LID=""
   for ((i = 0; i < n; i++)); do
     [ "${H_LID[$i]}" = 1 ] || continue
+    [ "${H_STATE[$i]}" != paused ] || continue
     lids=$((lids + 1))
     if [ -z "$F_LID" ] || [ "${H_END[$i]}" -gt "$F_LID" ]; then
       F_LID=${H_END[$i]}
@@ -1388,8 +1630,20 @@ forecast() {
   done
   F_GUARD=$(lid_guard "$lids")
 
+  # pause: when the last rule ends, if every rule has an end
+  local session holder until open=0
+  F_PAUSE="" F_RULES=""
+  while IFS=$'\t' read -r session holder until; do
+    F_RULES+="${F_RULES:+,}$(scope_name "$session" "$holder")"
+    [ "$until" != 0 ] || open=1
+    if [ "$until" -gt "${F_PAUSE:-0}" ]; then
+      F_PAUSE=$until
+    fi
+  done < <(pause_rules)
+  [ "$open" = 0 ] || F_PAUSE=""
+
   F_MACOS=$(macos_sleep_at "$NOW")
-  if [ "$n" -gt 0 ]; then
+  if [ -n "$F_END" ]; then
     F_SLEEP=$(macos_sleep_at "$F_END")
     if [ -n "$F_SLEEP" ] && [ "$F_SLEEP" -gt "$F_END" ]; then
       F_BY=macos
@@ -1449,6 +1703,8 @@ print_status_text() {
   table_row "$(marked macos macos)" "${c[0]}" "${c[1]}" "$(macos_details)"
   IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_LID")"
   table_row "$(marked lid lid)" "${c[0]}" "${c[1]}" "state=$L_STATE setting=$DEF_LID guard=$F_GUARD"
+  IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_PAUSE")"
+  table_row "$(marked pause pause)" "${c[0]}" "${c[1]}" "rules=${F_RULES:--}"
   table_print
 
   printf '\n'
@@ -1535,7 +1791,8 @@ print_status_json() {
       --arg lid "${H_LID[$i]}" --arg end "${H_END[$i]}" --arg by "${H_BY[$i]}" -n '$h + [{
         pid: ($pid | tonumber), session: $sid, name: (if $name == "" then null else $name end),
         holder: $holder, claude_pid: (if $claude == "0" then null else ($claude | tonumber) end),
-        alive: ($state == "alive"), started: ($at | tonumber), max_seconds: ($max | tonumber),
+        alive: ($state != "dead"), paused: ($state == "paused"), started: ($at | tonumber),
+        max_seconds: ($max | tonumber),
         min_battery: ($floor | tonumber), lid_closed: ($lid == "1"),
         ends: ($end | tonumber), ends_by: $by }]')
   done
@@ -1557,6 +1814,10 @@ print_status_json() {
       '{percent: $pct, floor: $floor, amperage_ma: $amp, capacity_mah: $raw,
         max_capacity_mah: $rawmax, external_power: ($ext == 1)}')
   fi
+  local pauses
+  pauses=$(pause_rules | jq -Rcn '[inputs | split("\t") | {
+    session: (if .[0] == "*" then null else .[0] end), holder: .[1],
+    until: (if .[2] == "0" then null else (.[2] | tonumber) end) }]')
   jq -n --argjson now "$NOW" --arg source "$M_SOURCE" \
     --argjson sleep "$(json_moment "$F_SLEEP")" --arg by "$F_BY" \
     --argjson time "$(json_moment "$F_TIME")" --argjson cap "$F_CAP" \
@@ -1565,6 +1826,7 @@ print_status_json() {
     --argjson display "$M_DISPLAY" --argjson sl "$M_SLEEP" --arg other "$M_OTHER" \
     --argjson lid "$(json_moment "$F_LID")" --arg lid_state "$L_STATE" \
     --arg lid_setting "$DEF_LID" --arg lid_guard "$F_GUARD" \
+    --argjson pause "$(json_moment "$F_PAUSE")" --argjson pauses "$pauses" \
     --argjson holds "$holds" --argjson stops "$stopped" '{
       now: $now, power: $source,
       sleep: ($sleep + {by: $by}),
@@ -1573,6 +1835,7 @@ print_status_json() {
       macos: ($macos + {last_input: $input, displaysleep_minutes: $display,
         sleep_minutes: $sl, other: (if $other == "" then [] else ($other | split(",")) end)}),
       lid: ($lid + {state: $lid_state, setting: $lid_setting, guard: $lid_guard}),
+      pause: ($pause + {rules: $pauses}),
       holds: $holds, stops: $stops }'
 }
 
@@ -1638,8 +1901,9 @@ cmd_kill_orphans() {
     if [ "$P_CLAUDE" != 0 ] && ! pid_alive "$P_CLAUDE"; then
       why="claude $P_CLAUDE exited"
     elif [ -z "$(caffeinate_of "$pid")" ] && [ $((now - P_AT)) -gt 5 ]; then
-      # A just-started watcher may not have its caffeinate yet.
-      why="no caffeinate"
+      # A just-started watcher may not have its caffeinate yet, and a paused
+      # one has none.
+      pause_match "$P_SID" "$P_HOLDER" || why="no caffeinate"
     fi
     [ -z "$why" ] || reap "$pid" "${WATCH_PREFIX}${tag}" "$why"
   done < <(list_watchers)
@@ -1809,6 +2073,8 @@ main() {
   kill-session) cmd_kill_session "$@" ;;
   kill-mine) die "kill-mine is now kill-session" 2 ;;
   kill-orphans) cmd_kill_orphans "$@" ;;
+  pause) cmd_pause "$@" ;;
+  resume) cmd_resume "$@" ;;
   config) cmd_config "$@" ;;
   sudoers) cmd_sudoers "$@" ;;
   help) cmd_help "$@" ;;
