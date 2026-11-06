@@ -727,7 +727,7 @@ Commands:
   start           start a hold
   stop            end a hold
   status          when the Mac will be allowed to sleep, and every hold
-  list            every hold, one tab-separated row each
+  list            every hold, one row each
   kill-session    end every hold of a session
   kill-orphans    end holds whose claude has exited, and stray processes
   config          show or change the settings
@@ -812,12 +812,16 @@ usage_list() {
   cat <<'EOF'
 Usage: claffeinate list [--json]
 
-List every hold on this Mac, one tab-separated row each:
+List every hold on this Mac, one row each, with these columns:
 
-  PID  SESSION  HOLDER  CLAUDE_PID  alive|dead  STARTED  MAX  FLOOR  LID
+  PID  SESSION  HOLDER  CLAUDE_PID  STATE  STARTED  MAX  FLOOR  LID
 
-PID is the watcher's; STARTED is in epoch seconds and MAX in seconds; LID
-is 1 for a hold that keeps the Mac awake with its lid closed.
+A terminal gets aligned columns under headers and a rule. Anything else,
+such as a pipe, gets tab-separated rows with no headers.
+
+PID is the watcher's; STATE is alive or dead; STARTED is in epoch seconds
+and MAX in seconds; LID is 1 for a hold that keeps the Mac awake with its
+lid closed.
 "dead" means its caffeinate or its claude process is gone, so
 kill-orphans would end it.
 
@@ -1191,9 +1195,41 @@ cmd_list() {
       max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber),
       lid_closed: (.[8] == "1")
     }]'
+  elif [ -t 1 ]; then
+    hold_table
   else
     cat
   fi
+}
+
+# Aligns tab-separated hold rows under headers and a rule.
+hold_table() {
+  {
+    printf 'PID\tSESSION\tHOLDER\tCLAUDE_PID\tSTATE\tSTARTED\tMAX\tFLOOR\tLID\n'
+    cat
+  } | awk -F'\t' '
+    {
+      for (i = 1; i <= NF; i++) {
+        cell[NR, i] = $i
+        if (length($i) > width[i]) width[i] = length($i)
+      }
+      if (NF > cols) cols = NF
+    }
+    END {
+      for (r = 1; r <= NR; r++) {
+        line = ""
+        rule = ""
+        for (i = 1; i <= cols; i++) {
+          gap = (i < cols) ? "  " : ""
+          line = line sprintf("%-*s", (i < cols) ? width[i] : 0, cell[r, i]) gap
+          dashes = sprintf("%*s", width[i], "")
+          gsub(/ /, "-", dashes)
+          rule = rule dashes gap
+        }
+        print line
+        if (r == 1) print rule
+      }
+    }'
 }
 
 # The session's name from its transcript: the last /rename, else the
