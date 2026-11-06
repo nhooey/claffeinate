@@ -1301,6 +1301,43 @@ test_sudoers_rule() {
   pass sudoers_rule
 }
 
+test_list_aligns_in_a_terminal() {
+  needs_exec list_aligns_in_a_terminal || return
+  local sid="${RUN}-lt" claude out header row piped
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  "${CLAFF[@]}" start --holder turn --session "$sid" --claude-pid "$claude" >/dev/null
+  # script(1) gives the command a terminal, and adds carriage returns and
+  # an echoed ^D.
+  out=$(script -q /dev/null "${CLAFF[@]}" list </dev/null 2>/dev/null |
+    tr -d '\r\004\010' | sed 's/^\^D//')
+  piped=$("${CLAFF[@]}" list | awk -F'\t' -v s="$sid" '$2 == s { print $3 }')
+  "${CLAFF[@]}" stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  if [ "$piped" != turn ]; then
+    fail list_aligns_in_a_terminal "a pipe should still get tabs: '$piped'"
+    return
+  fi
+  if [ -z "$out" ]; then
+    skip list_aligns_in_a_terminal "no terminal available here"
+    return
+  fi
+  header=$(printf '%s\n' "$out" | sed -n 1p)
+  row=$(printf '%s\n' "$out" | grep -- "$sid")
+  if [[ $header != "PID "*"SESSION "*"HOLDER "*"CLAUDE_PID  STATE  STARTED "*"MAX "*"FLOOR  LID" ]] ||
+    ! printf '%s\n' "$out" | sed -n 2p | grep -Eq '^-+(  -+){8}$'; then
+    fail list_aligns_in_a_terminal "no headers and rule: $out"
+    return
+  fi
+  if [ "${header%%HOLDER*}" = "$header" ] ||
+    [ "${#header}" -lt "${#row}" ] ||
+    [ "$(printf '%s' "${header%%HOLDER*}" | wc -c)" != "$(printf '%s' "${row%%turn*}" | wc -c)" ]; then
+    fail list_aligns_in_a_terminal "the columns don't line up: $out"
+    return
+  fi
+  pass list_aligns_in_a_terminal
+}
+
 # ---------------------------------------------------------------------------
 # Run: every test, or only those named on the command line
 # ---------------------------------------------------------------------------
@@ -1339,6 +1376,7 @@ TESTS=(
   lid_stale_flag_cleared
   battery_capacities_move
   sudoers_rule
+  list_aligns_in_a_terminal
 )
 for name in "${TESTS[@]}"; do
   if [ $# -eq 0 ] || [[ " $* " == *" $name "* ]]; then

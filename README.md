@@ -191,7 +191,7 @@ Every command has its own help: `claffeinate COMMAND --help`, or
 | `start [--holder H] [--wait-pid PID] [options]` | Start a hold, and print its watcher's PID.                                 |
 | `stop [--holder H]`                             | End a hold, logged as `ended`. Exits 3 if there is none.                   |
 | `status [--explain] [--stops N] [--json]`       | When the Mac may sleep, every hold, and the last stops.                    |
-| `list [--json]`                                 | One tab-separated row per hold.                                            |
+| `list [--json]`                                 | One row per hold: aligned in a terminal, tab-separated in a pipe.          |
 | `kill-session`                                  | End every hold of the session, logged as `killed`. Exits 3 if it has none. |
 | `kill-orphans [--dry-run]`                      | End what nothing else will end.                                            |
 | `config`, `config set`, `config unset`          | Show or change the settings.                                               |
