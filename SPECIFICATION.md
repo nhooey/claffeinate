@@ -76,6 +76,8 @@ session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--li
 3. Kill the `caffeinate`, write the stop log line. With `lid-1`, wait for
    the `caffeinate` to exit, then run `lid_sync`. Exit 0.
 
+A paused hold keeps its watcher and has no `caffeinate`. On each pass the watcher reads the rules: if one covers it, it ends its `caffeinate` and runs `lid_sync`; if none does, it starts one, and after a pause waits for it and runs `lid_sync`. Paused, it checks the `--wait-pid` target itself, naps no longer than the rule's end, and keeps every other limit. `start` during a pause starts a paused hold. `kill-orphans` leaves paused holds alone.
+
 ### The lid guard (`lid_sync`)
 
 A `PreventUserIdleSystemSleep` assertion doesn't stop lid-close sleep; only
@@ -114,6 +116,8 @@ claffeinate status [--explain] [--stops N] [--json|-j]
 claffeinate list [--json|-j]
 claffeinate kill-session [--session ID]
 claffeinate kill-orphans [--dry-run|-n]
+claffeinate pause [--session ID] [--holder GLOB] [--pid PID] [--for DURATION]
+claffeinate resume [--session ID] [--holder GLOB] [--pid PID]
 claffeinate config [--session ID]
 claffeinate config set (--session ID | --global) SETTING VALUE
 claffeinate config unset (--session ID | --global) SETTING
@@ -131,7 +135,9 @@ An unknown flag exits 2 naming `claffeinate COMMAND --help`.
 | `stop`         | Send `USR1` to the holder's watcher. Exit 3 if none.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `kill-session` | Send `TERM` to every watcher of the session. Exit 3 if none.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `kill-orphans` | Stop: a watcher whose claude PID is gone; a watcher with no `caffeinate` child, once older than 5 s; a tagged `caffeinate` whose parent isn't a watcher, logged as `killed`; a 0.2.0 heartbeat loop. Delete a session file whose `claude-pid` is gone. Print `killed PID NAME (WHY)` or `deleted FILE (WHY)`; `--dry-run` prints `would …` and changes nothing.                                                                                                                                                    |
-| `list`         | `PID SESSION HOLDER CLAUDE_PID alive\|dead STARTED MAX FLOOR LID`, tab-separated; a terminal gets aligned columns under headers and a rule. `dead`: no `caffeinate`, or the claude PID is gone.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `pause`        | Write a rule to `$STATE_DIR/pauses`, replacing one of the same scope, and send `USR2` to every watcher. No flags means every hold. `--pid` resolves to its hold's session and holder. A rule holds a session or `*`, a holder glob, and an end epoch or 0. |
+| `resume`       | Delete the rules within the scope and send `USR2` to every watcher. Exit 3 if none. |
+| `list`         | `PID SESSION HOLDER CLAUDE_PID alive\|paused\|dead STARTED MAX FLOOR LID`, tab-separated; a terminal gets aligned columns under headers and a rule. `dead`: no `caffeinate`, or the claude PID is gone.                                                                                                                                                                                                                                                                                                                                                                                  |
 | `status`       | Below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `config`       | Each setting's value and layer, then the session file, config file and log paths. `set` validates the value; `set`/`unset` on a session also record `claude-pid = $CLAUDE_PID`.                                                                                                                                                                                                                                                                                                                                    |
 

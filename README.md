@@ -194,6 +194,8 @@ Every command has its own help: `claffeinate COMMAND --help`, or
 | `list [--json]`                                 | One row per hold: aligned in a terminal, tab-separated in a pipe.          |
 | `kill-session`                                  | End every hold of the session, logged as `killed`. Exits 3 if it has none. |
 | `kill-orphans [--dry-run]`                      | End what nothing else will end.                                            |
+| `pause [SCOPE] [--for DURATION]`                | Let the Mac sleep despite holds, for all of them or some.                  |
+| `resume [SCOPE]`                                | End a pause. Exits 3 if none matched.                                      |
 | `config`, `config set`, `config unset`          | Show or change the settings.                                               |
 | `sudoers`                                       | Print the sudoers rule that lets holds outlast a closed lid.               |
 
@@ -324,6 +326,32 @@ instead of pasting it.
 > ends, up to `awake-max-duration`. It also runs on battery, down to
 > `awake-min-battery`; don't set that to `0` with this on. To keep the lid
 > in charge, set `awake-lid-closed` to `off`.
+
+### Pausing
+
+`claffeinate pause` lets the Mac sleep without ending any hold, and
+`claffeinate resume` brings them back. Holds that start during a pause start
+paused, so the next prompt doesn't undo it.
+
+```sh
+claffeinate pause --for 30m                # every hold, for 30 minutes
+claffeinate pause --session "$ID"          # one session's holds
+claffeinate pause --holder 'subagent-*'    # some holders, in any session
+claffeinate pause --pid 62208              # one hold, by its PID from `list`
+claffeinate resume                         # end every pause
+```
+
+`--session` and `--holder` can go together. Without `--for`, a pause runs until
+you resume it, even across a reboot. A `resume` with a scope ends only the
+pauses within it, so `resume --session "$ID"` doesn't end a pause of everything.
+
+A paused hold shows as `🟡 paused`, and the `🛑 pause` line of `status` lists the
+pauses. Its time limit, battery floor and claude check all go on, and the time
+limit isn't extended. A pause also releases the lid guard once no running hold
+needs it, so a closed lid sleeps the Mac.
+
+A pause covers only claffeinate's own holds. `status` lists anything else
+keeping the Mac awake as `other=`, such as Claude Code's own `caffeinate`.
 
 ### Scripting with `--json`
 

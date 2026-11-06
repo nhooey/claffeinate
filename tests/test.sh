@@ -612,7 +612,7 @@ test_start_rejects_bad_values() {
 # ---------------------------------------------------------------------------
 test_per_command_help() {
   local cmd out via_help rc
-  for cmd in start stop list status kill-session kill-orphans config sudoers; do
+  for cmd in start stop list status kill-session kill-orphans pause resume config sudoers; do
     out=$("${CLAFF[@]}" "$cmd" --help 2>&1)
     rc=$?
     if [ "$rc" != "0" ] || [[ $out != "Usage: claffeinate $cmd"* ]]; then
@@ -729,6 +729,7 @@ claffeinate  2026-10-16 15:30  macOS 15.6.1  power=battery  holds=0
 🔋 battery  -      -       now=64% floor=20% rate=-11%/h
 💻 macos    15:34  +4m     input=15:29(-40s) display=5m sleep=1m other=-
 📕 lid      -      -       state=open setting=off guard=off
+🛑 pause    -      -       rules=-
 
 PID    SESSION   NAME                    HOLDER                         CLAUDE  STATE     STARTED          ENDS
 (none)
@@ -1339,6 +1340,221 @@ test_list_aligns_in_a_terminal() {
 }
 
 # ---------------------------------------------------------------------------
+# Pauses, against the stubs so that only this run's watchers are signalled
+# ---------------------------------------------------------------------------
+
+# Prints the STATE of session $1's holder $2.
+hold_state() {
+  stubbed list | awk -F'\t' -v s="$1" -v h="$2" '$2 == s && $3 == h { print $5 }'
+}
+
+# Waits up to 5 seconds for session $1's holder $2 to reach state $3.
+wait_state() {
+  local i=0
+  while [ "$(hold_state "$1" "$2")" != "$3" ]; do
+    i=$((i + 1))
+    [ "$i" -le 50 ] || return 1
+    sleep 0.1
+  done
+}
+
+# Prints how many caffeinates run under watcher $1.
+caffeinates_of() {
+  ps -A -ww -o ppid=,command= | awk -v p="$1" '$1 == p && $2 ~ /^caffeinate--claffeinate--/ { n++ } END { print n + 0 }'
+}
+
+test_pause_stops_prevention_and_resume_restores() {
+  needs_exec pause_stops_prevention_and_resume_restores || return
+  local name=pause_stops_prevention_and_resume_restores sid="${RUN}-pa" claude pid out
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  pid=$(stubbed start --holder turn --session "$sid" --claude-pid "$claude")
+  out=$(stubbed pause)
+  if [ "$out" != "paused all" ] || ! wait_state "$sid" turn paused; then
+    fail "$name" "pause should leave the hold paused: $out, $(hold_state "$sid" turn)"
+    return
+  fi
+  if [ "$(caffeinates_of "$pid")" != 0 ] || ! kill -0 "$pid" 2>/dev/null; then
+    fail "$name" "the watcher should live on with no caffeinate"
+    return
+  fi
+  out=$(stubbed list --json | jq -r --arg s "$sid" '.[] | select(.session == $s) | "\(.alive) \(.paused)"')
+  if [ "$out" != "true true" ]; then
+    fail "$name" "list --json should say alive and paused: $out"
+    return
+  fi
+  out=$(stubbed kill-orphans --dry-run)
+  if [[ $out == *"$sid"* ]]; then
+    fail "$name" "kill-orphans should leave a paused hold: $out"
+    return
+  fi
+  out=$(stubbed status)
+  if [[ $out != *"rules=all"* ]]; then
+    fail "$name" "status should show the pause: $out"
+    return
+  fi
+  out=$(stubbed resume)
+  if [ "$out" != "resumed all" ] || ! wait_state "$sid" turn alive; then
+    fail "$name" "resume should bring the hold back: $out, $(hold_state "$sid" turn)"
+    return
+  fi
+  if [ "$(caffeinates_of "$pid")" != 1 ]; then
+    fail "$name" "the same watcher should have a new caffeinate"
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  if stubbed resume >/dev/null 2>&1; then
+    fail "$name" "resume with no pause should exit non-zero"
+    return
+  fi
+  pass "$name"
+}
+
+test_pause_targets_a_subset() {
+  needs_exec pause_targets_a_subset || return
+  local name=pause_targets_a_subset a="${RUN}-pb" b="${RUN}-pc" claude pid
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  stubbed start --holder turn --session "$a" --claude-pid "$claude" >/dev/null
+  stubbed start --holder subagent-x --session "$a" --claude-pid "$claude" >/dev/null
+  pid=$(stubbed start --holder turn --session "$b" --claude-pid "$claude")
+
+  stubbed pause --session "$a" --holder 'subagent-*' >/dev/null
+  if ! wait_state "$a" subagent-x paused || [ "$(hold_state "$a" turn)" != alive ] ||
+    [ "$(hold_state "$b" turn)" != alive ]; then
+    fail "$name" "only the subagent should pause: $(stubbed list)"
+    return
+  fi
+  stubbed resume --session "$a" >/dev/null
+  wait_state "$a" subagent-x alive
+
+  stubbed pause --pid "$pid" >/dev/null
+  if ! wait_state "$b" turn paused || [ "$(hold_state "$a" turn)" != alive ]; then
+    fail "$name" "only the hold with that PID should pause: $(stubbed list)"
+    return
+  fi
+  stubbed resume >/dev/null
+  wait_state "$b" turn alive
+
+  # A resume narrower than the pause ends nothing.
+  stubbed pause >/dev/null
+  wait_state "$b" turn paused
+  if stubbed resume --session "$a" >/dev/null 2>&1; then
+    fail "$name" "resume --session shouldn't end a pause of everything"
+    return
+  fi
+  stubbed resume >/dev/null
+  stubbed kill-session --session "$a"
+  stubbed kill-session --session "$b"
+  wait_gone "$a" "" 5
+  wait_gone "$b" "" 5
+  if stubbed pause --pid 1 >/dev/null 2>&1 || stubbed pause --pid 1 --session x >/dev/null 2>&1 ||
+    stubbed pause --holder 'a b' >/dev/null 2>&1 || stubbed pause --for soon >/dev/null 2>&1; then
+    fail "$name" "bad scopes should be refused"
+    return
+  fi
+  pass "$name"
+}
+
+test_pause_covers_holds_started_later() {
+  needs_exec pause_covers_holds_started_later || return
+  local name=pause_covers_holds_started_later sid="${RUN}-pd" claude pid
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  stubbed pause >/dev/null
+  pid=$(stubbed start --holder turn --session "$sid" --claude-pid "$claude")
+  if [ "$(hold_state "$sid" turn)" != paused ] || [ "$(caffeinates_of "$pid")" != 0 ]; then
+    fail "$name" "a hold started during a pause should be paused"
+    stubbed resume >/dev/null
+    return
+  fi
+  stubbed resume >/dev/null
+  if ! wait_state "$sid" turn alive; then
+    fail "$name" "resume should start its first caffeinate"
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  pass "$name"
+}
+
+test_pause_for_ends_by_itself() {
+  needs_exec pause_for_ends_by_itself || return
+  local name=pause_for_ends_by_itself sid="${RUN}-pe" claude
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  CLAFFEINATE_WATCH_INTERVAL=60 stubbed start --holder turn --session "$sid" --claude-pid "$claude" >/dev/null
+  stubbed pause --for 2 >/dev/null
+  if ! wait_state "$sid" turn paused || ! wait_state "$sid" turn alive; then
+    fail "$name" "the hold should come back without waiting a full check: $(hold_state "$sid" turn)"
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  pass "$name"
+}
+
+test_paused_hold_still_ends() {
+  needs_exec paused_hold_still_ends || return
+  local name=paused_hold_still_ends sid="${RUN}-pf" claude shell
+  claude=$(fake_process)
+  shell=$(fake_process)
+  FAKES+=("$claude" "$shell")
+  stubbed start --holder shell-a --session "$sid" --claude-pid "$claude" --wait-pid "$shell" >/dev/null
+  stubbed start --holder turn --session "$sid" --claude-pid "$claude" >/dev/null
+  stubbed start --holder subagent-b --session "$sid" --claude-pid "$claude" --awake-max-duration 3 >/dev/null
+  stubbed pause >/dev/null
+  wait_state "$sid" shell-a paused
+  kill "$shell" 2>/dev/null
+  if ! wait_gone "$sid" shell-a 5; then
+    fail "$name" "a paused hold should end with its --wait-pid target"
+    stubbed resume >/dev/null
+    return
+  fi
+  if ! wait_gone "$sid" subagent-b 6; then
+    fail "$name" "a paused hold should end at its time limit"
+    stubbed resume >/dev/null
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  if ! wait_gone "$sid" turn 5; then
+    fail "$name" "stop should end a paused hold"
+    stubbed resume >/dev/null
+    return
+  fi
+  stubbed resume >/dev/null
+  pass "$name"
+}
+
+test_pause_releases_the_lid_guard() {
+  needs_exec pause_releases_the_lid_guard || return
+  local name=pause_releases_the_lid_guard sid="${RUN}-pg"
+  lid_reset
+  lid_claude
+  lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  if ! lid_wait_flag 1; then
+    fail "$name" "the hold should set disablesleep"
+    return
+  fi
+  stubbed pause >/dev/null
+  if ! lid_wait_flag 0; then
+    fail "$name" "a pause should clear disablesleep"
+    stubbed resume >/dev/null
+    return
+  fi
+  stubbed resume >/dev/null
+  if ! lid_wait_flag 1; then
+    fail "$name" "resume should set disablesleep again"
+    return
+  fi
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" turn 5
+  lid_wait_flag 0
+  pass "$name"
+}
+
+# ---------------------------------------------------------------------------
 # Run: every test, or only those named on the command line
 # ---------------------------------------------------------------------------
 TESTS=(
@@ -1377,6 +1593,12 @@ TESTS=(
   battery_capacities_move
   sudoers_rule
   list_aligns_in_a_terminal
+  pause_stops_prevention_and_resume_restores
+  pause_targets_a_subset
+  pause_covers_holds_started_later
+  pause_for_ends_by_itself
+  paused_hold_still_ends
+  pause_releases_the_lid_guard
 )
 for name in "${TESTS[@]}"; do
   if [ $# -eq 0 ] || [[ " $* " == *" $name "* ]]; then
