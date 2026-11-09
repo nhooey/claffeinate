@@ -1740,13 +1740,10 @@ print_status_text() {
   printf '\n'
   table_reset 5 6 8 "$NAME_WIDTH" "$HOLDER_WIDTH" 16
   table_row STOPPED "" SESSION NAME HOLDER REASON RAN
-  local rows=0 sid holder reason ran start stop
-  while read -r _ sid holder reason ran start stop; do
-    sid=${sid#session=} holder=${holder#holder=} reason=${reason#reason=}
-    ran=${ran#ran=} stop=${stop#stop=}
-    [[ $stop =~ ^[0-9]+$ ]] || continue
+  local rows=0 stop start ran sid holder reason name
+  while IFS=$'\t' read -r stop start ran sid holder reason name; do
     IFS=$'\t' read -r -a s <<<"$(moment_cells "$stop")"
-    table_row "${s[0]}" "${s[1]}" "${sid:0:8}" "$(short_name "$(session_name "$sid")")" \
+    table_row "${s[0]}" "${s[1]}" "${sid:0:8}" "$(short_name "$name")" \
       "$(marked "$(holder_kind "$holder")" "$holder")" "$(marked "$reason" "$reason")" "$ran"
     rows=$((rows + 1))
   done < <(last_stops "$stops")
@@ -1777,9 +1774,25 @@ How macOS decides to sleep, on this Mac now ($M_SOURCE power):
 EOF
 }
 
-# The last $1 lines of the stop log, newest first.
+# The stops in the last $1 lines of the stop log, newest first, as
+# tab-separated rows: STOP START RAN SESSION HOLDER REASON NAME, where NAME is
+# the session's name or empty. Skips a line that isn't a stop.
 last_stops() {
-  tail -n "$1" "$LOG_FILE" 2>/dev/null | awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' || true
+  local stop start ran sid holder reason name
+  { tail -n "$1" "$LOG_FILE" 2>/dev/null || true; } | awk '
+    { l[NR] = $0 }
+    END {
+      for (i = NR; i > 0; i--) {
+        if (split(l[i], f, " ") < 7) continue
+        for (j = 2; j <= 7; j++) sub(/^[^=]*=/, "", f[j])
+        if (f[7] !~ /^[0-9]+$/) continue
+        print f[7] "\t" f[6] "\t" f[5] "\t" f[2] "\t" f[3] "\t" f[4]
+      }
+    }' | while IFS=$'\t' read -r stop start ran sid holder reason; do
+    name=$(session_name "$sid")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$stop" "$start" "$ran" "$sid" "$holder" "$reason" \
+      "${name//$'\t'/ }"
+  done
 }
 
 # A moment as JSON: {"at": epoch, "in": seconds}, or null.
@@ -1806,17 +1819,9 @@ print_status_json() {
         min_battery: ($floor | tonumber), lid_closed: ($lid == "1"),
         ends: ($end | tonumber), ends_by: $by }]')
   done
-  local sid holder reason ran start stop
-  while read -r _ sid holder reason ran start stop; do
-    stop=${stop#stop=}
-    [[ $stop =~ ^[0-9]+$ ]] || continue
-    sid=${sid#session=}
-    stopped=$(jq -c --argjson s "$stopped" --arg sid "$sid" --arg name "$(session_name "$sid")" \
-      --arg holder "${holder#holder=}" --arg reason "${reason#reason=}" --arg ran "${ran#ran=}" \
-      --arg start "${start#start=}" --arg stop "$stop" -n '$s + [{
-        stopped: ($stop | tonumber), started: ($start | tonumber), ran: $ran, session: $sid,
-        name: (if $name == "" then null else $name end), holder: $holder, reason: $reason }]')
-  done < <(last_stops "$stops")
+  stopped=$(last_stops "$stops" | jq -Rcn '[inputs | split("\t") | {
+    stopped: (.[0] | tonumber), started: (.[1] | tonumber), ran: .[2], session: .[3],
+    name: (if .[6] == "" then null else .[6] end), holder: .[4], reason: .[5] }]')
   local bat="null"
   if [ "$B_PRESENT" = 1 ]; then
     bat=$(jq -cn --argjson pct "$B_PCT" --argjson amp "$B_AMP" --argjson floor "$F_FLOOR" \
