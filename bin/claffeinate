@@ -1502,6 +1502,15 @@ short_name() {
 
 # ---------- how macOS decides to sleep ----------
 
+# Setting $3 of section $2 (such as "AC Power:") in `pmset -g custom` output
+# $1; else its value in the first section that has it; else 0.
+pmset_setting() {
+  printf '%s\n' "$1" | awk -v s="$2" -v k="$3" '
+    /^[A-Za-z].*:$/ { in_s = ($0 == s); next }
+    $1 == k { if (in_s) { v = $2; got = 1 } else if (!got) first = $2 }
+    END { print (got ? v : (first == "" ? 0 : first)) }'
+}
+
 # The macOS-specific part of the forecast. A port to another OS replaces
 # this function: Linux has systemd-inhibit and logind's IdleActionSec.
 #
@@ -1521,14 +1530,8 @@ macos_sleep_model() {
   esac
   local custom
   custom=$(pmset -g custom 2>/dev/null || true)
-  M_DISPLAY=$(printf '%s\n' "$custom" | awk -v s="$section" -v k=displaysleep '
-    /^[A-Za-z].*:$/ { in_s = ($0 == s); seen = seen || in_s; next }
-    $1 == k { if (in_s) { v = $2; got = 1 } else if (!got) first = $2 }
-    END { print (got ? v : (first == "" ? 0 : first)) }')
-  M_SLEEP=$(printf '%s\n' "$custom" | awk -v s="$section" -v k=sleep '
-    /^[A-Za-z].*:$/ { in_s = ($0 == s); next }
-    $1 == k { if (in_s) { v = $2; got = 1 } else if (!got) first = $2 }
-    END { print (got ? v : (first == "" ? 0 : first)) }')
+  M_DISPLAY=$(pmset_setting "$custom" "$section" displaysleep)
+  M_SLEEP=$(pmset_setting "$custom" "$section" sleep)
   idle_ns=$(ioreg -c IOHIDSystem -d 4 2>/dev/null | awk '/"HIDIdleTime" =/ { print $NF; exit }' || true)
   [[ ${idle_ns:-} =~ ^[0-9]+$ ]] || idle_ns=0
   M_INPUT=$((NOW - idle_ns / 1000000000))
@@ -1676,12 +1679,18 @@ battery_details() {
   printf 'now=%s%% %s %s\n' "$B_PCT" "$floor" "$rate"
 }
 
+# A pmset timer of $1 minutes as a duration, or "never" for 0.
+fmt_minutes() {
+  if [ "$1" -gt 0 ]; then
+    fmt_duration $(($1 * 60))
+  else
+    printf 'never\n'
+  fi
+}
+
 macos_details() {
-  local d="never" s="never"
-  [ "$M_DISPLAY" -gt 0 ] && d=$(fmt_duration $((M_DISPLAY * 60)))
-  [ "$M_SLEEP" -gt 0 ] && s=$(fmt_duration $((M_SLEEP * 60)))
-  printf 'input=%s display=%s sleep=%s other=%s\n' \
-    "$(fmt_moment "$M_INPUT")" "$d" "$s" "${M_OTHER:--}"
+  printf 'input=%s display=%s sleep=%s other=%s\n' "$(fmt_moment "$M_INPUT")" \
+    "$(fmt_minutes "$M_DISPLAY")" "$(fmt_minutes "$M_SLEEP")" "${M_OTHER:--}"
 }
 
 print_status_text() {
@@ -1741,9 +1750,6 @@ print_status_text() {
   table_print
 
   [ "$explain" = 1 ] || return 0
-  local d="never" sl="never"
-  [ "$M_DISPLAY" -gt 0 ] && d=$(fmt_duration $((M_DISPLAY * 60)))
-  [ "$M_SLEEP" -gt 0 ] && sl=$(fmt_duration $((M_SLEEP * 60)))
   cat <<EOF
 
 How macOS decides to sleep, on this Mac now ($M_SOURCE power):
@@ -1751,10 +1757,10 @@ How macOS decides to sleep, on this Mac now ($M_SOURCE power):
   it starts no new timer: it only stops preventing sleep.
 - macOS counts idle time from your last keyboard, mouse or trackpad
   input, input=$(fmt_moment "$M_INPUT"), holds or not.
-- The display turns off once you've been idle for displaysleep, $d.
+- The display turns off once you've been idle for displaysleep, $(fmt_minutes "$M_DISPLAY").
   Until then powerd holds "Prevent sleep while display is on".
 - The Mac sleeps once you've been idle for both displaysleep and sleep,
-  $sl, unless another process holds an assertion: other=${M_OTHER:--}.
+  $(fmt_minutes "$M_SLEEP"), unless another process holds an assertion: other=${M_OTHER:--}.
 - So once the last hold ends, the Mac sleeps at the latest of: that
   moment, your last input + displaysleep, and your last input + sleep.
   If you've been away longer than that already, it sleeps within seconds.
@@ -1870,6 +1876,16 @@ cmd_status() {
 
 # ---------- kill-orphans ----------
 
+# Kills PID $2, named $3, for reason $4; only says it would with $1 = 1.
+reap() {
+  if [ "$1" = 1 ]; then
+    printf 'would kill %s %s (%s)\n' "$2" "$3" "$4"
+  else
+    kill "$2" 2>/dev/null || true
+    printf 'killed %s %s (%s)\n' "$2" "$3" "$4"
+  fi
+}
+
 cmd_kill_orphans() {
   local dry_run=0
   while [ $# -gt 0 ]; do
@@ -1883,16 +1899,6 @@ cmd_kill_orphans() {
   now=$(date +%s)
   load_procs
 
-  reap() {
-    # $1 PID, $2 process name, $3 why
-    if [ "$dry_run" = 1 ]; then
-      printf 'would kill %s %s (%s)\n' "$1" "$2" "$3"
-    else
-      kill "$1" 2>/dev/null || true
-      printf 'killed %s %s (%s)\n' "$1" "$2" "$3"
-    fi
-  }
-
   while read -r pid tag; do
     [ -n "$pid" ] || continue
     watchers+="$pid "
@@ -1905,21 +1911,21 @@ cmd_kill_orphans() {
       # one has none.
       pause_match "$P_SID" "$P_HOLDER" || why="no caffeinate"
     fi
-    [ -z "$why" ] || reap "$pid" "${WATCH_PREFIX}${tag}" "$why"
+    [ -z "$why" ] || reap "$dry_run" "$pid" "${WATCH_PREFIX}${tag}" "$why"
   done < <(list_watchers)
 
   local parent
   while read -r pid parent tag; do
     [ -n "$pid" ] || continue
     case "$watchers" in *" $parent "*) continue ;; esac
-    reap "$pid" "${CAFF_PREFIX}${tag}" "no watcher"
+    reap "$dry_run" "$pid" "${CAFF_PREFIX}${tag}" "no watcher"
     if [ "$dry_run" = 0 ] && parse_tag "$tag"; then
       log_stop "$P_SID" "$P_HOLDER" killed "$P_AT"
     fi
   done < <(list_caffeinates)
 
   for pid in $(pgrep -a -f -- "$LEGACY_HEARTBEAT_PATTERN" 2>/dev/null || true); do
-    reap "$pid" heartbeat "0.2.0 heartbeat"
+    reap "$dry_run" "$pid" heartbeat "0.2.0 heartbeat"
   done
 
   # Watchers sync by themselves, but a caffeinate without one can't; the
