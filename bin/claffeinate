@@ -653,10 +653,6 @@ lid_sync() {
   unlock_holder "$lock"
 }
 
-# ---------- the watcher ----------
-
-# Runs one hold: starts its caffeinate, then ends it on the first limit
-# reached, and logs why.
 # ---------- pauses ----------
 
 # A rule file holds SESSION, HOLDER and UNTIL, tab-separated. SESSION is an id
@@ -720,6 +716,10 @@ wake_watchers() {
   done < <(list_watchers)
 }
 
+# ---------- the watcher ----------
+
+# Runs one hold: starts its caffeinate, then ends it on the first limit
+# reached, and logs why.
 cmd_watch() {
   set +e
   local tag="$1" flags="$2" target="$3"
