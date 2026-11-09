@@ -409,39 +409,51 @@ session_conf() {
 # R_VALUE (normalized), R_RAW and R_SOURCE. A layer holding a bad value is
 # warned about and skipped, so a typo never leaves the Mac without a limit.
 resolve_setting() {
-  local name="$1" flag="${2:-}" sid="${3:-}" raw var
+  local name="$1" flag="${2:-}" sid="${3:-}" raw var layer where
   R_VALUE="" R_RAW="" R_SOURCE=""
   if [ -n "$flag" ]; then
     R_RAW="$flag" R_SOURCE="flag"
     R_VALUE=$(setting_normalize "$name" "$flag") || die "--$name: bad value: $flag" 2
     return 0
   fi
-  if [ -n "$sid" ] && raw=$(conf_get "$(session_conf "$sid")" "$name"); then
-    if R_VALUE=$(setting_normalize "$name" "$raw"); then
-      R_RAW="$raw" R_SOURCE="session"
-      return 0
-    fi
-    warn "$name: bad value '$raw' in $(session_conf "$sid"); ignored"
-  fi
   var=$(setting_env_name "$name")
-  raw="${!var:-}"
-  if [ -n "$raw" ]; then
+  for layer in session env config; do
+    case "$layer" in
+    session)
+      [ -n "$sid" ] || continue
+      where=$(session_conf "$sid")
+      raw=$(conf_get "$where" "$name") || continue
+      ;;
+    env)
+      where="\$$var" raw="${!var:-}"
+      [ -n "$raw" ] || continue
+      ;;
+    config)
+      where="$CONFIG_FILE"
+      raw=$(conf_get "$where" "$name") || continue
+      ;;
+    esac
     if R_VALUE=$(setting_normalize "$name" "$raw"); then
-      R_RAW="$raw" R_SOURCE="env"
+      R_RAW="$raw" R_SOURCE="$layer"
       return 0
     fi
-    warn "$name: bad value '$raw' in \$$var; ignored"
-  fi
-  if raw=$(conf_get "$CONFIG_FILE" "$name"); then
-    if R_VALUE=$(setting_normalize "$name" "$raw"); then
-      R_RAW="$raw" R_SOURCE="config"
-      return 0
-    fi
-    warn "$name: bad value '$raw' in $CONFIG_FILE; ignored"
-  fi
+    warn "$name: bad value '$raw' in $where; ignored"
+  done
   R_RAW=$(setting_default "$name")
   R_VALUE=$(setting_normalize "$name" "$R_RAW")
   R_SOURCE="default"
+}
+
+# Resolves the three limits of a hold in session $4, the flags $1 to $3 for
+# awake-max-duration, awake-min-battery and awake-lid-closed first, into
+# LIM_MAX (seconds), LIM_FLOOR (percent) and LIM_LID (on or off).
+resolve_limits() {
+  resolve_setting awake-max-duration "$1" "$4"
+  LIM_MAX="$R_VALUE"
+  resolve_setting awake-min-battery "$2" "$4"
+  LIM_FLOOR="$R_VALUE"
+  resolve_setting awake-lid-closed "$3" "$4"
+  LIM_LID="$R_VALUE"
 }
 
 # Decides EMOJI_ON from --emoji/--no-emoji, the emoji setting and the
@@ -1211,13 +1223,9 @@ cmd_start() {
   [[ $claude =~ ^[0-9]+$ ]] || die "--claude-pid: not a PID: $claude" 2
   [ -z "$wait_pid" ] || [[ $wait_pid =~ ^[1-9][0-9]*$ ]] || die "--wait-pid: not a PID: $wait_pid" 2
 
-  resolve_setting awake-max-duration "$max_flag" "$sid"
-  local max="$R_VALUE"
-  resolve_setting awake-min-battery "$floor_flag" "$sid"
-  local floor="$R_VALUE"
-  resolve_setting awake-lid-closed "$lid_flag" "$sid"
-  local lid=0
-  [ "$R_VALUE" = off ] || lid=1
+  resolve_limits "$max_flag" "$floor_flag" "$lid_flag" "$sid"
+  local max="$LIM_MAX" floor="$LIM_FLOOR" lid=0
+  [ "$LIM_LID" = off ] || lid=1
 
   command -v caffeinate >/dev/null 2>&1 || die "caffeinate not found on PATH"
   local target="${wait_pid:-$claude}"
@@ -1559,7 +1567,7 @@ lid_guard() {
     else
       printf 'stale\n'
     fi
-  elif [ -f "$LID_DENIED" ] && [ "$DEF_LID" = on ]; then
+  elif [ -f "$LID_DENIED" ] && [ "$LIM_LID" = on ]; then
     printf 'denied\n'
   else
     printf 'off\n'
@@ -1590,8 +1598,8 @@ forecast() {
   macos_sleep_model "$ours"
 
   # time: the latest cap among the holds
-  F_TIME="" F_CAP="$DEF_MAX"
-  F_FLOOR="$DEF_FLOOR" F_BATTERY=""
+  F_TIME="" F_CAP="$LIM_MAX"
+  F_FLOOR="$LIM_FLOOR" F_BATTERY=""
   F_END="" F_BY=""
   H_END=() H_BY=()
   local first=1
@@ -1702,7 +1710,7 @@ print_status_text() {
   IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_MACOS")"
   table_row "$(marked macos macos)" "${c[0]}" "${c[1]}" "$(macos_details)"
   IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_LID")"
-  table_row "$(marked lid lid)" "${c[0]}" "${c[1]}" "state=$L_STATE setting=$DEF_LID guard=$F_GUARD"
+  table_row "$(marked lid lid)" "${c[0]}" "${c[1]}" "state=$L_STATE setting=$LIM_LID guard=$F_GUARD"
   IFS=$'\t' read -r -a c <<<"$(moment_cells "$F_PAUSE")"
   table_row "$(marked pause pause)" "${c[0]}" "${c[1]}" "rules=${F_RULES:--}"
   table_print
@@ -1825,7 +1833,7 @@ print_status_json() {
     --argjson macos "$(json_moment "$F_MACOS")" --argjson input "$M_INPUT" \
     --argjson display "$M_DISPLAY" --argjson sl "$M_SLEEP" --arg other "$M_OTHER" \
     --argjson lid "$(json_moment "$F_LID")" --arg lid_state "$L_STATE" \
-    --arg lid_setting "$DEF_LID" --arg lid_guard "$F_GUARD" \
+    --arg lid_setting "$LIM_LID" --arg lid_guard "$F_GUARD" \
     --argjson pause "$(json_moment "$F_PAUSE")" --argjson pauses "$pauses" \
     --argjson holds "$holds" --argjson stops "$stopped" '{
       now: $now, power: $source,
@@ -1852,13 +1860,7 @@ cmd_status() {
   done
   [[ $stops =~ ^[0-9]+$ ]] || die "--stops: not a number: $stops" 2
   [ "$json" = 0 ] || require_jq
-  local sid="${CLAUDE_CODE_SESSION_ID:-}"
-  resolve_setting awake-max-duration "" "$sid" 2>/dev/null
-  DEF_MAX="$R_VALUE"
-  resolve_setting awake-min-battery "" "$sid" 2>/dev/null
-  DEF_FLOOR="$R_VALUE"
-  resolve_setting awake-lid-closed "" "$sid" 2>/dev/null
-  DEF_LID="$R_VALUE"
+  resolve_limits "" "" "" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null
   collect_holds
   forecast
   if [ "$json" = 1 ]; then
