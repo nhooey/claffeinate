@@ -750,16 +750,12 @@ cmd_watch() {
         lid_sync
       fi
     fi
-    if [ -n "$caf" ] && ! kill -0 "$caf" 2>/dev/null; then
-      if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
-        reason="claude-exited"
-      else
-        reason=ended
-      fi
-      break
-    fi
     if [ "$claude" != 0 ] && ! kill -0 "$claude" 2>/dev/null; then
       reason="claude-exited"
+      break
+    fi
+    if [ -n "$caf" ] && ! kill -0 "$caf" 2>/dev/null; then
+      reason=ended
       break
     fi
     # With no caffeinate -w running, the watcher watches the target itself.
