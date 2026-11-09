@@ -1414,8 +1414,34 @@ collect_holds() {
   done < <(list_watchers)
 }
 
+# Prints each hold as a tab-separated row: PID SESSION HOLDER CLAUDE_PID
+# STATE STARTED MAX FLOOR LID. With $1 = forecast, after forecast has run,
+# each row goes on with NAME (the session's, or empty), ENDS and ENDS_BY.
+holds_tsv() {
+  local i name
+  for ((i = 0; i < ${#H_PID[@]}; i++)); do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${H_PID[$i]}" "${H_SID[$i]}" \
+      "${H_HOLDER[$i]}" "${H_CLAUDE[$i]}" "${H_STATE[$i]}" "${H_AT[$i]}" \
+      "${H_MAX[$i]}" "${H_FLOOR[$i]}" "${H_LID[$i]}"
+    if [ "${1:-}" = forecast ]; then
+      name=$(session_name "${H_SID[$i]}")
+      printf '\t%s\t%s\t%s' "${name//$'\t'/ }" "${H_END[$i]}" "${H_BY[$i]}"
+    fi
+    printf '\n'
+  done
+}
+
+# A jq function turning a row of holds_tsv, split on tabs, into the JSON
+# object both `list --json` and `status --json` print.
+readonly HOLD_JQ='def hold: {
+  pid: (.[0] | tonumber), session: .[1], holder: .[2],
+  claude_pid: (if .[3] == "0" then null else (.[3] | tonumber) end),
+  alive: (.[4] != "dead"), paused: (.[4] == "paused"), started: (.[5] | tonumber),
+  max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber),
+  lid_closed: (.[8] == "1") };'
+
 cmd_list() {
-  local json=0 i
+  local json=0
   while [ $# -gt 0 ]; do
     case "$1" in
     --json | -j) json=1 && shift ;;
@@ -1425,20 +1451,8 @@ cmd_list() {
   done
   [ "$json" = 0 ] || require_jq
   collect_holds
-  {
-    for ((i = 0; i < ${#H_PID[@]}; i++)); do
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${H_PID[$i]}" "${H_SID[$i]}" \
-        "${H_HOLDER[$i]}" "${H_CLAUDE[$i]}" "${H_STATE[$i]}" "${H_AT[$i]}" \
-        "${H_MAX[$i]}" "${H_FLOOR[$i]}" "${H_LID[$i]}"
-    done
-  } | if [ "$json" = 1 ]; then
-    jq -Rn '[inputs | select(length > 0) | split("\t") | {
-      pid: (.[0] | tonumber), session: .[1], holder: .[2],
-      claude_pid: (if .[3] == "0" then null else (.[3] | tonumber) end),
-      alive: (.[4] != "dead"), paused: (.[4] == "paused"), started: (.[5] | tonumber),
-      max_seconds: (.[6] | tonumber), min_battery: (.[7] | tonumber),
-      lid_closed: (.[8] == "1")
-    }]'
+  holds_tsv | if [ "$json" = 1 ]; then
+    jq -Rn "$HOLD_JQ"' [inputs | select(length > 0) | split("\t") | hold]'
   elif [ -t 1 ]; then
     hold_table
   else
@@ -1805,20 +1819,10 @@ json_moment() {
 }
 
 print_status_json() {
-  local stops="$1" i n=${#H_PID[@]} holds="[]" stopped="[]"
-  for ((i = 0; i < n; i++)); do
-    holds=$(jq -c --argjson h "$holds" --arg pid "${H_PID[$i]}" --arg sid "${H_SID[$i]}" \
-      --arg name "$(session_name "${H_SID[$i]}")" --arg holder "${H_HOLDER[$i]}" \
-      --arg claude "${H_CLAUDE[$i]}" --arg state "${H_STATE[$i]}" \
-      --arg at "${H_AT[$i]}" --arg max "${H_MAX[$i]}" --arg floor "${H_FLOOR[$i]}" \
-      --arg lid "${H_LID[$i]}" --arg end "${H_END[$i]}" --arg by "${H_BY[$i]}" -n '$h + [{
-        pid: ($pid | tonumber), session: $sid, name: (if $name == "" then null else $name end),
-        holder: $holder, claude_pid: (if $claude == "0" then null else ($claude | tonumber) end),
-        alive: ($state != "dead"), paused: ($state == "paused"), started: ($at | tonumber),
-        max_seconds: ($max | tonumber),
-        min_battery: ($floor | tonumber), lid_closed: ($lid == "1"),
-        ends: ($end | tonumber), ends_by: $by }]')
-  done
+  local stops="$1" holds stopped
+  holds=$(holds_tsv forecast | jq -Rcn "$HOLD_JQ"' [inputs | split("\t") |
+    hold + { name: (if .[9] == "" then null else .[9] end),
+      ends: (.[10] | tonumber), ends_by: .[11] }]')
   stopped=$(last_stops "$stops" | jq -Rcn '[inputs | split("\t") | {
     stopped: (.[0] | tonumber), started: (.[1] | tonumber), ran: .[2], session: .[3],
     name: (if .[6] == "" then null else .[6] end), holder: .[4], reason: .[5] }]')
