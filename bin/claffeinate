@@ -243,6 +243,7 @@ utf8_locale() {
 T_ROWS=()
 T_MIN=()
 T_NONE=0
+T_RULE=0
 
 # Starts a table whose columns are at least the widths given, so its shape
 # stays the same from one reading to the next.
@@ -250,6 +251,12 @@ table_reset() {
   T_ROWS=()
   T_MIN=("$@")
   T_NONE=0
+  T_RULE=0
+}
+
+# Draws a rule of dashes under the first row.
+table_rule() {
+  T_RULE=1
 }
 
 # Marks the table empty: "(none)" prints under the header, and takes no
@@ -280,7 +287,7 @@ cell_width() {
 
 # Prints the rows, each column padded to its widest cell, 2 spaces apart.
 table_print() {
-  local widths=() row cells i w c text pad out
+  local widths=() row cells i w c text pad out ruled=0
   [ "${#T_ROWS[@]}" -gt 0 ] || return 0
   widths=(${T_MIN[@]+"${T_MIN[@]}"})
   for row in "${T_ROWS[@]}"; do
@@ -319,6 +326,15 @@ table_print() {
       fi
     done
     printf '%s\n' "${out%"${out##*[! ]}"}"
+    if [ "$T_RULE" = 1 ] && [ "$ruled" = 0 ]; then
+      ruled=1
+      out=""
+      for ((i = 0; i < ${#widths[@]}; i++)); do
+        printf -v pad '%*s' "${widths[i]}" ''
+        out+="${out:+  }${pad// /-}"
+      done
+      printf '%s\n' "$out"
+    fi
   done
   [ "$T_NONE" = 0 ] || printf '(none)\n'
 }
@@ -1444,32 +1460,15 @@ cmd_list() {
 
 # Aligns tab-separated hold rows under headers and a rule.
 hold_table() {
-  {
-    printf 'PID\tSESSION\tHOLDER\tCLAUDE_PID\tSTATE\tSTARTED\tMAX\tFLOOR\tLID\n'
-    cat
-  } | awk -F'\t' '
-    {
-      for (i = 1; i <= NF; i++) {
-        cell[NR, i] = $i
-        if (length($i) > width[i]) width[i] = length($i)
-      }
-      if (NF > cols) cols = NF
-    }
-    END {
-      for (r = 1; r <= NR; r++) {
-        line = ""
-        rule = ""
-        for (i = 1; i <= cols; i++) {
-          gap = (i < cols) ? "  " : ""
-          line = line sprintf("%-*s", (i < cols) ? width[i] : 0, cell[r, i]) gap
-          dashes = sprintf("%*s", width[i], "")
-          gsub(/ /, "-", dashes)
-          rule = rule dashes gap
-        }
-        print line
-        if (r == 1) print rule
-      }
-    }'
+  local row cells
+  table_reset
+  table_rule
+  table_row PID SESSION HOLDER CLAUDE_PID STATE STARTED MAX FLOOR LID
+  while IFS= read -r row; do
+    IFS=$'\t' read -r -a cells <<<"$row"
+    table_row "${cells[@]}"
+  done
+  table_print
 }
 
 # The session's name from its transcript: the last /rename, else the
