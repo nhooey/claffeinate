@@ -101,8 +101,11 @@ unknown_flag() {
   return 2
 }
 
-need_value() {
-  [ "$2" -ge 2 ] || die "$1 requires a value" 2
+# Sets the caller's variable $1 to the value after flag $2, as in
+# `--session) take sid "$@" && shift 2 ;;`, or fails when there is none.
+take() {
+  [ $# -ge 3 ] || die "$2 requires a value" 2
+  printf -v "$1" '%s' "$3"
 }
 
 # The one source of "now", so a test can pin it with CLAFFEINATE_NOW.
@@ -1190,13 +1193,13 @@ cmd_start() {
     --idle | -i | --disk | -m | --system | -s | --user | -u)
       die "$1 is gone: every hold keeps the Mac from sleeping, and --keep-display-on keeps the display on too" 2
       ;;
-    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
-    --claude-pid) need_value "$1" $# && claude="$2" && shift 2 ;;
-    --wait-pid) need_value "$1" $# && wait_pid="$2" && shift 2 ;;
-    --awake-max-duration) need_value "$1" $# && max_flag="$2" && shift 2 ;;
-    --awake-min-battery) need_value "$1" $# && floor_flag="$2" && shift 2 ;;
-    --awake-lid-closed) need_value "$1" $# && lid_flag="$2" && shift 2 ;;
+    --holder) take holder "$@" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
+    --claude-pid) take claude "$@" && shift 2 ;;
+    --wait-pid) take wait_pid "$@" && shift 2 ;;
+    --awake-max-duration) take max_flag "$@" && shift 2 ;;
+    --awake-min-battery) take floor_flag "$@" && shift 2 ;;
+    --awake-lid-closed) take lid_flag "$@" && shift 2 ;;
     --timeout | -t) die "--timeout is now --awake-max-duration" 2 ;;
     --help | -h) usage_start && return 0 ;;
     *) unknown_flag start "$1" ;;
@@ -1262,8 +1265,8 @@ cmd_stop() {
   local holder="manual" sid=""
   while [ $# -gt 0 ]; do
     case "$1" in
-    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --holder) take holder "$@" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
     --help | -h) usage_stop && return 0 ;;
     *) unknown_flag stop "$1" ;;
     esac
@@ -1281,7 +1284,7 @@ cmd_kill_session() {
   local sid=""
   while [ $# -gt 0 ]; do
     case "$1" in
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
     --help | -h) usage_kill_session && return 0 ;;
     *) unknown_flag kill-session "$1" ;;
     esac
@@ -1333,10 +1336,10 @@ cmd_pause() {
   local sid="" holder="" pid="" for_flag="" until=0
   while [ $# -gt 0 ]; do
     case "$1" in
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
-    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
-    --pid) need_value "$1" $# && pid="$2" && shift 2 ;;
-    --for) need_value "$1" $# && for_flag="$2" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
+    --holder) take holder "$@" && shift 2 ;;
+    --pid) take pid "$@" && shift 2 ;;
+    --for) take for_flag "$@" && shift 2 ;;
     --help | -h) usage_pause && return 0 ;;
     *) unknown_flag pause "$1" ;;
     esac
@@ -1361,9 +1364,9 @@ cmd_resume() {
   local sid="" holder="" pid=""
   while [ $# -gt 0 ]; do
     case "$1" in
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
-    --holder) need_value "$1" $# && holder="$2" && shift 2 ;;
-    --pid) need_value "$1" $# && pid="$2" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
+    --holder) take holder "$@" && shift 2 ;;
+    --pid) take pid "$@" && shift 2 ;;
     --help | -h) usage_resume && return 0 ;;
     *) unknown_flag resume "$1" ;;
     esac
@@ -1845,7 +1848,7 @@ cmd_status() {
     case "$1" in
     --json | -j) json=1 && shift ;;
     --explain) explain=1 && shift ;;
-    --stops) need_value "$1" $# && stops="$2" && shift 2 ;;
+    --stops) take stops "$@" && shift 2 ;;
     --help | -h) usage_status && return 0 ;;
     *) unknown_flag status "$1" ;;
     esac
@@ -1957,7 +1960,7 @@ cmd_config() {
   while [ $# -gt 0 ]; do
     case "$1" in
     set | unset) action="$1" && shift ;;
-    --session) need_value "$1" $# && sid="$2" && shift 2 ;;
+    --session) take sid "$@" && shift 2 ;;
     --global) global=1 && shift ;;
     --help | -h) usage_config && return 0 ;;
     -*) unknown_flag config "$1" ;;
