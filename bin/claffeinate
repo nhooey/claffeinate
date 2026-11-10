@@ -265,19 +265,6 @@ table_row() {
   T_ROWS+=("$*")
 }
 
-# Width of a cell as drawn with emoji, so a column keeps its width with
-# them off.
-cell_width() {
-  local c="$1"
-  if [ "${c:0:1}" = $'\001' ]; then
-    c="${c#$'\001'}"
-    c="${c#*$'\001'}"
-    printf '%d\n' "$((${#c} + 3))"
-  else
-    printf '%d\n' "${#c}"
-  fi
-}
-
 # Prints the rows, each column padded to its widest cell, 2 spaces apart.
 table_print() {
   local widths=() row cells i w c text pad out
@@ -286,7 +273,15 @@ table_print() {
   for row in "${T_ROWS[@]}"; do
     IFS=$'\037' read -r -a cells <<<"$row"
     for ((i = 0; i < ${#cells[@]}; i++)); do
-      w=$(cell_width "${cells[$i]}")
+      # A marked cell counts as drawn with its emoji, so a column keeps its
+      # width with them off.
+      c="${cells[$i]}"
+      if [ "${c:0:1}" = $'\001' ]; then
+        c="${c#$'\001'*$'\001'}"
+        w=$((${#c} + 3))
+      else
+        w=${#c}
+      fi
       if [ "$i" -ge "${#widths[@]}" ] || [ "$w" -gt "${widths[$i]}" ]; then
         widths[i]=$w
       fi
@@ -297,7 +292,6 @@ table_print() {
     out=""
     for ((i = 0; i < ${#cells[@]}; i++)); do
       c="${cells[$i]}"
-      w=$(cell_width "$c")
       if [ "${c:0:1}" = $'\001' ]; then
         c="${c#$'\001'}"
         text="${c#*$'\001'}"
