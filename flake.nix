@@ -105,10 +105,11 @@
                 '';
 
             # Acceptance tests. Run against the source script (not the wrapped
-            # binary): test 8 stubs jq via PATH, which the wrapper's hardcoded
-            # PATH would defeat. Sandbox/CI does not have a live Claude Code
-            # session, so tests 4 (kill-orphans no-op when alive) and 6
-            # (claude-pid resolves) skip there.
+            # binary): json_without_jq_fails stubs jq via PATH, which the
+            # wrapper's hardcoded PATH would defeat. The build sandbox blocks
+            # caffeinate(1), /bin/sleep and ps(1), so every test that calls
+            # needs_exec skips here; tests/test.sh outside the sandbox runs
+            # them all.
             tests =
               pkgs.runCommand "claffeinate-tests"
                 {
@@ -127,8 +128,8 @@
                   # Macros + caffeinate(1) live in /usr/bin and /bin on macOS;
                   # add them since the Nix sandbox PATH lists only build inputs.
                   export PATH="/usr/bin:/bin:$PATH"
-                  # /tmp/claffeinate/ may be owned by another user on shared
-                  # /tmp; redirect to a build-private dir.
+                  # Keep the build off the shared /tmp/claffeinate-$UID/: use a
+                  # build-private run dir.
                   export CLAFFEINATE_RUN_DIR="$PWD/run/"
                   bash tests/test.sh
                   touch $out
