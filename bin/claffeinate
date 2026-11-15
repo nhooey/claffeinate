@@ -34,12 +34,11 @@
 set -euo pipefail
 
 readonly CAFF_PREFIX="caffeinate--claffeinate--"
-# Matches a tagged caffeinate's argv[0]; 0.2.0's had a symlink directory
-# before the name.
+# Matches a tagged caffeinate's argv[0], with or without the symlink
+# directory before the name that 0.2.0's tags carry.
 readonly CAFF_PATTERN="^(/[^ ]*/)?${CAFF_PREFIX}"
 readonly WATCH_PREFIX="claffeinate-watch--"
-# 0.2.0's instances and heartbeat loops, reaped by kill-orphans after an
-# upgrade.
+# The heartbeat loops 0.2.0 started, which kill-orphans reaps.
 readonly LEGACY_HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -1207,9 +1206,9 @@ cmd_start() {
   while [ $# -gt 0 ]; do
     case "$1" in
     --keep-display-on) flags="di" && shift ;;
-    --display | -d) die "--display is now --keep-display-on" 2 ;;
+    --display | -d) die "use --keep-display-on instead of --display" 2 ;;
     --idle | -i | --disk | -m | --system | -s | --user | -u)
-      die "$1 is gone: every hold keeps the Mac from sleeping, and --keep-display-on keeps the display on too" 2
+      die "$1 isn't an option: every hold keeps the Mac from sleeping, and --keep-display-on keeps the display on too" 2
       ;;
     --holder) take holder "$@" && shift 2 ;;
     --session) take sid "$@" && shift 2 ;;
@@ -1218,7 +1217,7 @@ cmd_start() {
     --awake-max-duration) take max_flag "$@" && shift 2 ;;
     --awake-min-battery) take floor_flag "$@" && shift 2 ;;
     --awake-lid-closed) take lid_flag "$@" && shift 2 ;;
-    --timeout | -t) die "--timeout is now --awake-max-duration" 2 ;;
+    --timeout | -t) die "use --awake-max-duration instead of --timeout" 2 ;;
     --help | -h) usage_start && return 0 ;;
     *) unknown_flag start "$1" ;;
     esac
@@ -2080,7 +2079,7 @@ main() {
     cmd_status "$@"
     ;;
   kill-session) cmd_kill_session "$@" ;;
-  kill-mine) die "kill-mine is now kill-session" 2 ;;
+  kill-mine) die "use kill-session instead of kill-mine" 2 ;;
   kill-orphans) cmd_kill_orphans "$@" ;;
   pause) cmd_pause "$@" ;;
   resume) cmd_resume "$@" ;;

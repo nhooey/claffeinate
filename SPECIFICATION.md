@@ -55,8 +55,8 @@ session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--li
   subshell before `exec caffeinate`) carry its argv until they exec.
 - The target of `-w` is `--wait-pid` if given, else the claude PID, else
   none.
-- 0.2.0's tagged caffeinates had a symlink directory before the name; the
-  pattern `^(/[^ ]*/)?caffeinate--claffeinate--` matches both.
+- The pattern `^(/[^ ]*/)?caffeinate--claffeinate--` also matches a
+  symlink directory before the name, as in 0.2.0's tags.
 
 ### The watcher (`cmd_watch`)
 

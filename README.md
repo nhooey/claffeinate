@@ -126,8 +126,8 @@ you turn that on under `/plugin` → Marketplaces. To update by hand:
 ```
 
 Run `/reload-plugins` in every open session: a session keeps the hooks it
-loaded until then. After updating from 0.2.0, `claffeinate kill-orphans`
-stops 0.2.0's instances.
+loaded until then. `claffeinate kill-orphans` also stops any instances
+that 0.2.0 started.
 
 **Uninstalling.** Run `/plugin uninstall claffeinate@claffeinate`, then
 `claffeinate kill-session` in a session that still has holds.
@@ -220,7 +220,7 @@ still turns off, unless you pass `--keep-display-on`.
 | `--keep-display-on`             | keeps the display on too               |
 
 DURATION is a number with units, largest first: `30s`, `45m`, `1h30m`, `2d`.
-A bare number is seconds. `--timeout` is now `--awake-max-duration`.
+A bare number is seconds.
 
 ```sh
 claffeinate start --keep-display-on --awake-max-duration 1h30m   # a presentation
