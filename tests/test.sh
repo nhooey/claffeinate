@@ -590,17 +590,17 @@ test_start_rejects_bad_values() {
     fi
   done
   out=$("${CLAFF[@]}" start --timeout 1h 2>&1)
-  if [[ $out != *"--timeout is now --awake-max-duration"* ]]; then
+  if [[ $out != *"use --awake-max-duration instead of --timeout"* ]]; then
     fail start_rejects_bad_values "--timeout should point at --awake-max-duration: $out"
     return
   fi
   out=$("${CLAFF[@]}" start --display 2>&1)
-  if [[ $out != *"--display is now --keep-display-on"* ]]; then
+  if [[ $out != *"use --keep-display-on instead of --display"* ]]; then
     fail start_rejects_bad_values "--display should point at --keep-display-on: $out"
     return
   fi
   out=$("${CLAFF[@]}" kill-mine 2>&1)
-  if [[ $out != *"kill-mine is now kill-session"* ]]; then
+  if [[ $out != *"use kill-session instead of kill-mine"* ]]; then
     fail start_rejects_bad_values "kill-mine should point at kill-session: $out"
     return
   fi
