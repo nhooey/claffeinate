@@ -287,6 +287,17 @@ claffeinate config set --global awake-min-battery 30
 claffeinate config set --global awake-lid-closed off   # let the lid sleep the Mac
 ```
 
+These variables move claffeinate's files or change how often a hold
+checks its limits:
+
+| Variable                     | Default                                            |
+| ---------------------------- | -------------------------------------------------- |
+| `CLAFFEINATE_CONFIG`         | `${XDG_CONFIG_HOME:-~/.config}/claffeinate/config` |
+| `CLAFFEINATE_STATE_DIR`      | `${XDG_STATE_HOME:-~/.local/state}/claffeinate`    |
+| `CLAFFEINATE_RUN_DIR`        | `/tmp/claffeinate-$UID/`, ending in `/`            |
+| `CLAFFEINATE_LOG`            | `~/Library/Logs/claffeinate.log`                   |
+| `CLAFFEINATE_WATCH_INTERVAL` | `60`, in seconds                                   |
+
 ### Closing the lid
 
 Apple's `IOPMLib.h` says of the assertion `caffeinate -i` takes: "The system
