@@ -43,6 +43,22 @@ readonly LEGACY_HEARTBEAT_PATTERN='^sh -c .*awake \(full-dir='
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 readonly SELF
+# The shipped defaults file, installed beside the script as
+# ../share/claffeinate/defaults.conf. Found through the script's real path,
+# so a symlink to it in ~/bin still finds it.
+real_self() {
+  local p="$SELF" l
+  while [ -L "$p" ]; do
+    l=$(readlink "$p")
+    case "$l" in
+    /*) p="$l" ;;
+    *) p="$(dirname "$p")/$l" ;;
+    esac
+  done
+  printf '%s\n' "$p"
+}
+DEFAULTS_FILE="$(cd "$(dirname "$(real_self)")/.." && pwd)/share/claffeinate/defaults.conf"
+readonly DEFAULTS_FILE
 # Every path is overridable, for tests and sandboxed builds. RUN_DIR must
 # end with "/".
 readonly RUN_DIR="${CLAFFEINATE_RUN_DIR:-/tmp/claffeinate-${UID}/}"
@@ -343,13 +359,10 @@ setting_env_name() {
   printf 'CLAFFEINATE_%s\n' "$n"
 }
 
+# The setting's value in the shipped defaults file, the one place a
+# default is written.
 setting_default() {
-  case "$1" in
-  awake-max-duration) printf '4h\n' ;;
-  awake-min-battery) printf '20\n' ;;
-  awake-lid-closed) printf 'on\n' ;;
-  emoji) printf 'on\n' ;;
-  esac
+  conf_get "$DEFAULTS_FILE" "$1" || die "$1: no default in $DEFAULTS_FILE"
 }
 
 # Prints the setting's value in its working form: seconds, a percent, or
@@ -417,9 +430,10 @@ session_conf() {
 }
 
 # Resolves setting $1, strongest layer first: the flag $2, the session
-# file of session $3, the variable, the config file, the default. Sets
-# R_VALUE (normalized), R_RAW and R_SOURCE. A layer holding a bad value is
-# warned about and skipped, so a typo never leaves the Mac without a limit.
+# file of session $3, the variable, the config file, the shipped defaults
+# file. Sets R_VALUE (normalized), R_RAW and R_SOURCE. A layer holding a
+# bad value is warned about and skipped, so a typo never leaves the Mac
+# without a limit.
 resolve_setting() {
   local name="$1" flag="${2:-}" sid="${3:-}" raw var layer where
   R_VALUE="" R_RAW="" R_SOURCE=""
@@ -898,16 +912,16 @@ Options:
   --wait-pid PID      end the hold when PID exits; default the claude PID
   --awake-max-duration DURATION
                       the longest the hold keeps the Mac awake: 30s, 60m,
-                      1h30m, 2d; a bare number is seconds (default 4h)
+                      1h30m, 2d; a bare number is seconds
   --awake-min-battery PERCENT
                       end the hold at this battery level; 0 never
-                      (default 20)
   --awake-lid-closed on|off
-                      keep the Mac awake with its lid closed (default on)
+                      keep the Mac awake with its lid closed
   --keep-display-on   keep the display on too
   --help              show this help
 
-See 'claffeinate config --help' for where these settings can be set.
+See 'claffeinate config --help' for where these settings can be set,
+and 'claffeinate config --defaults' for their defaults.
 
 Examples:
   claffeinate start
@@ -1078,17 +1092,19 @@ EOF
 usage_config() {
   cat <<'EOF'
 Usage: claffeinate config [--session ID]
+       claffeinate config --defaults
        claffeinate config set (--session ID | --global) SETTING VALUE
        claffeinate config unset (--session ID | --global) SETTING
 
-Show each setting's value and the layer it came from, or change one.
+Show each setting's value and the layer it came from, print the shipped
+defaults file, or change one setting.
 
 Settings:
-  awake-max-duration  the longest one hold keeps the Mac awake (4h)
-  awake-min-battery   the battery percent at which holds end; 0 never (20)
+  awake-max-duration  the longest one hold keeps the Mac awake
+  awake-min-battery   the battery percent at which holds end; 0 never
   awake-lid-closed    on or off: holds keep the Mac awake with its lid
-                      closed; on needs 'claffeinate sudoers' (on)
-  emoji               on or off, for the status output (on)
+                      closed; on needs 'claffeinate sudoers'
+  emoji               on or off, for the status output
 
 Layers, strongest first:
   flag     --awake-max-duration, --awake-min-battery, --awake-lid-closed,
@@ -1100,12 +1116,14 @@ Layers, strongest first:
            takes these from --settings, then .claude/settings.json, then
            ~/.claude/settings.json, then the environment it was started in
   config   $XDG_CONFIG_HOME/claffeinate/config (~/.config/claffeinate/config)
-  default
+  default  the shipped defaults file, share/claffeinate/defaults.conf
+           where claffeinate is installed
 
-Both files hold "setting = value" lines. A setting takes effect for holds
-started after the change.
+All three files hold "setting = value" lines. The session and config
+files name only the settings they change. A setting takes effect for holds started after the change.
 
 Options:
+  --defaults    print the shipped defaults file, with its comments
   --session ID  the session to show or change; default
                 $CLAUDE_CODE_SESSION_ID for show
   --global      change the config file
@@ -1965,6 +1983,7 @@ cmd_config() {
   while [ $# -gt 0 ]; do
     case "$1" in
     set | unset) action="$1" && shift ;;
+    --defaults) action=defaults && shift ;;
     --session) take sid "$@" && shift 2 ;;
     --global) global=1 && shift ;;
     --help | -h) usage_config && return 0 ;;
@@ -1974,6 +1993,11 @@ cmd_config() {
   done
   local file
   case "$action" in
+  defaults)
+    [ "${#args[@]}" -eq 0 ] || die "config --defaults: unexpected argument: ${args[0]}" 2
+    [ -f "$DEFAULTS_FILE" ] || die "missing the defaults file: $DEFAULTS_FILE"
+    cat "$DEFAULTS_FILE"
+    ;;
   show)
     [ "${#args[@]}" -eq 0 ] || die "config: unexpected argument: ${args[0]}" 2
     [ -n "$sid" ] || sid="${CLAUDE_CODE_SESSION_ID:-}"
@@ -1988,8 +2012,8 @@ cmd_config() {
       table_row "$name" "$shown" "$R_SOURCE"
     done
     table_print
-    printf '\nsession  %s\nconfig   %s\nlog      %s\n' \
-      "$([ -n "$sid" ] && session_conf "$sid" || printf -- '-')" "$CONFIG_FILE" "$LOG_FILE"
+    printf '\nsession   %s\nconfig    %s\ndefaults  %s\nlog       %s\n' \
+      "$([ -n "$sid" ] && session_conf "$sid" || printf -- '-')" "$CONFIG_FILE" "$DEFAULTS_FILE" "$LOG_FILE"
     ;;
   set | unset)
     if [ "$global" = 1 ]; then
