@@ -496,14 +496,20 @@ checkout. The script reads the hook's JSON payload on stdin, takes
 
 ## Development
 
+Work inside the dev shell (`nix develop`); `menu` lists its commands. They
+are tokens of one tool, `scripts/claff-dev`, and `claff-dev --help` lists
+them all:
+
 ```sh
-tests/test.sh [TEST...]                # acceptance tests, or only those named
-nix flake check                        # shellcheck and the tests
-claude plugin validate --strict .      # the manifests (validate-plugin in the dev shell)
-claude --plugin-dir . -p "…"           # try the plugin from this checkout
+run-tests [TEST...]     # acceptance tests, or only those named
+lint                    # shellcheck
+check                   # nix flake check: shellcheck and all the tests
+validate-plugin         # the manifests
+try-plugin "…"          # claude -p with the plugin from this checkout
+claff-dev build         # the package
 ```
 
-`--plugin-dir` takes over from an installed copy of the same plugin for
+`try-plugin` takes over from an installed copy of the same plugin for
 that session.
 
 To release, raise `version` in `.claude-plugin/plugin.json`. Installed
