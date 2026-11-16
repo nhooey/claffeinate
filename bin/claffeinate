@@ -2094,4 +2094,8 @@ main() {
   esac
 }
 
-main "$@"
+# Sourced, as tests/test.sh does to call a function directly, it only
+# defines them.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
