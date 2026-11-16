@@ -651,6 +651,13 @@ test_unknown_setting_refused() {
       fail "$name" "$cmd should refuse a misspelt setting: rc=$rc $out"
       return
     }
+    # Its help still shows, to say how to fix the file.
+    out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" "${cmd%% *}" --help 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && [[ $out == "Usage: claffeinate ${cmd%% *}"* ]] || {
+      fail "$name" "${cmd%% *} --help should work despite a misspelt setting: rc=$rc $out"
+      return
+    }
   done
   # Commands that end holds still work, so a typo never keeps one running.
   out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" kill-session --session "$sid" 2>&1)
