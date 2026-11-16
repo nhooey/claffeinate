@@ -162,7 +162,10 @@ strongest first, in `resolve_setting`:
 
 Files hold `setting = value` lines, `#` comments, last one wins, parsed
 with `awk` and never sourced. A bad value in layers 2–4 warns on stderr and
-falls through; a bad flag exits 2.
+falls through; a bad flag exits 2. `start`, `status` and `config` exit 2 on
+a line in the defaults, config or session file that names no setting (a
+session file may also hold `claude-pid`), or when the defaults file is
+missing; the commands that end holds never read the files.
 
 ## Paths
 
@@ -349,6 +352,7 @@ build.
 | `kill_orphans`                | each orphan kind and a dead session file; `--dry-run` stops nothing; a live hold is untouched |
 | `config_precedence`           | default, config, variable, session and flag in order; a bad variable warns and falls through; `set` needs a layer and a valid value; the tag records what applied |
 | `shipped_defaults`            | the defaults file names every setting, each under a comment; `config --defaults` prints it; no or an empty config gives the defaults; a symlinked script finds it |
+| `unknown_setting_refused`     | a misspelt key or a line without `=` makes `config`, `status` and `start` exit 2; `kill-session` ignores it; a session file allows `claude-pid` only |
 | `start_rejects_bad_values`    | bad durations, floors, holders, sessions and PIDs exit 2; `--timeout` names its successor |
 | `per_command_help`            | every command's `--help`, `help COMMAND` and unknown flag                               |
 | `json_parses`                 | `list --json` and `status --json` parse, with the hold and the macOS block              |

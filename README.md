@@ -285,7 +285,8 @@ The strongest layer wins:
 
 The files hold `setting = value` lines. Put only the settings you change
 in your config file, not a copy of the defaults, so new defaults reach you
-when you update. A hold keeps the settings it started with;
+when you update. A line that names no setting is an error, so a typo can't
+silently do nothing. A hold keeps the settings it started with;
 `claffeinate config` shows each value and its layer.
 
 ```sh
