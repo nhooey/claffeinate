@@ -58,6 +58,10 @@ EOF
 chmod +x "${BASE}/sudo-stub/sudo"
 PATH="${BASE}/sudo-stub:$PATH"
 REAL_PATH="$PATH"
+# The ps on PATH before any stub: the Nix check supplies a non-setuid one,
+# since the build denies exec of the setuid /bin/ps.
+REAL_PS=$(command -v ps)
+export REAL_PS
 export RUN="t$$"
 
 FAILS=0
@@ -87,10 +91,16 @@ skip() {
   SKIPS=$((SKIPS + 1))
 }
 
-# Skips test $1 when processes can't be started.
+# Skips test $1 when processes can't be started, or fails it under
+# CLAFFEINATE_TESTS_REQUIRE_EXEC=1, as the Nix check sets, so that check
+# can't pass by skipping.
 needs_exec() {
   [ "$SYSTEM_EXEC_BLOCKED" = 0 ] && return 0
-  skip "$1" "needs caffeinate(1), /bin/sleep and ps(1) (build sandbox blocks them)"
+  if [ "${CLAFFEINATE_TESTS_REQUIRE_EXEC:-0}" = 1 ]; then
+    fail "$1" "needs caffeinate(1), /bin/sleep and ps(1), which can't run here"
+  else
+    skip "$1" "needs caffeinate(1), /bin/sleep and ps(1) (build sandbox blocks them)"
+  fi
   return 1
 }
 
@@ -190,7 +200,7 @@ printf '#!/usr/bin/env bash\necho 15.6.1\n' >"${STUBS}/sw_vers"
 # disablesleep set under a test.
 cat >"${STUBS}/ps" <<'EOF'
 #!/usr/bin/env bash
-/bin/ps "$@" | grep -- "session-${RUN}"
+"$REAL_PS" "$@" | grep -- "session-${RUN}"
 exit 0
 EOF
 chmod +x "${STUBS}"/*
@@ -575,6 +585,94 @@ test_config_precedence() {
   pass config_precedence
 }
 
+test_shipped_defaults() {
+  local name=shipped_defaults defaults="${ROOT_DIR}/share/claffeinate/defaults.conf"
+  local keys settings out empty="${BASE}/empty-config" link="${BASE}/link-bin"
+  # Complete: the file's keys are exactly the settings the script knows.
+  keys=$(awk -F= '!/^[[:space:]]*(#|$)/ { gsub(/[[:space:]]/, "", $1); print $1 }' "$defaults" | sort)
+  # shellcheck source=/dev/null disable=SC2086,SC2153
+  settings=$(source "${ROOT_DIR}/bin/claffeinate" && printf '%s\n' $SETTINGS | sort)
+  [ -n "$keys" ] && [ "$keys" = "$settings" ] || {
+    fail "$name" "the defaults file's keys '$keys' should be the settings '$settings'"
+    return
+  }
+  # Every setting has a comment right above it.
+  out=$(awk '!/^[[:space:]]*(#|$)/ && prev !~ /^#/ { print } { prev = $0 }' "$defaults")
+  [ -z "$out" ] || {
+    fail "$name" "uncommented settings: $out"
+    return
+  }
+  out=$("${CLAFF[@]}" config --defaults)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "config --defaults should print the shipped file"
+    return
+  }
+  # No config file, or an empty one, gives exactly the defaults.
+  : >"$empty"
+  for cfg in "${BASE}/no-such-config" "$empty"; do
+    out=$(env -u CLAFFEINATE_AWAKE_LID_CLOSED CLAFFEINATE_CONFIG="$cfg" \
+      bash -c "$(declare -p CLAFF); \"\${CLAFF[@]}\" config --session ${RUN}-defaults" |
+      awk 'NR > 1 && NF == 3 { print $1, $2, $3 }')
+    [ "$out" = "awake-max-duration 4h default
+awake-min-battery 20% default
+awake-lid-closed on default
+emoji on default" ] || {
+      fail "$name" "config $cfg should give the defaults: $out"
+      return
+    }
+  done
+  # A symlink to the script, as a ~/bin install makes, still finds the file.
+  mkdir -p "$link"
+  ln -s "${ROOT_DIR}/bin/claffeinate" "${link}/claffeinate"
+  out=$(bash "${link}/claffeinate" config --defaults 2>&1)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "a symlinked script should find the defaults file: $out"
+    return
+  }
+  pass "$name"
+}
+
+test_unknown_setting_refused() {
+  local name=unknown_setting_refused cfg="${BASE}/typo-config" sid="${RUN}-typo" out rc cmd
+  printf 'awake-max-duraton = 8h\n' >"$cfg"
+  for cmd in "config" "status" "start --session $sid --claude-pid 0"; do
+    # shellcheck disable=SC2086
+    out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" $cmd 2>&1)
+    rc=$?
+    [ "$rc" = 2 ] && [[ $out == *"unknown setting: awake-max-duraton"* ]] || {
+      "${CLAFF[@]}" kill-session --session "$sid" >/dev/null 2>&1
+      fail "$name" "$cmd should refuse a misspelt setting: rc=$rc $out"
+      return
+    }
+  done
+  # Commands that end holds still work, so a typo never keeps one running.
+  out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" kill-session --session "$sid" 2>&1)
+  [[ $out != *"unknown setting"* ]] || {
+    fail "$name" "kill-session should ignore the config file: $out"
+    return
+  }
+  printf 'awake-max-duration 8h\n' >"$cfg"
+  out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" config 2>&1)
+  [ $? = 2 ] && [[ $out == *"unknown setting: awake-max-duration 8h"* ]] || {
+    fail "$name" "a line without = should be refused: $out"
+    return
+  }
+  # A session file may record its claude PID, and nothing else unknown.
+  CLAUDE_PID=$$ "${CLAFF[@]}" config set --session "$sid" emoji off >/dev/null
+  "${CLAFF[@]}" config --session "$sid" >/dev/null 2>&1 || {
+    fail "$name" "a session file's claude-pid should be accepted"
+    return
+  }
+  printf 'colour = on\n' >>"${CLAFFEINATE_STATE_DIR}/sessions/${sid}.conf"
+  out=$("${CLAFF[@]}" config --session "$sid" 2>&1)
+  [ $? = 2 ] && [[ $out == *"unknown setting: colour"* ]] || {
+    fail "$name" "a session file's unknown setting should be refused: $out"
+    return
+  }
+  rm -f "${CLAFFEINATE_STATE_DIR}/sessions/${sid}.conf"
+  pass "$name"
+}
+
 test_start_rejects_bad_values() {
   local bad out rc
   for bad in "--awake-max-duration 1x" "--awake-max-duration 30ms" "--awake-max-duration 1m1h" \
@@ -590,17 +688,17 @@ test_start_rejects_bad_values() {
     fi
   done
   out=$("${CLAFF[@]}" start --timeout 1h 2>&1)
-  if [[ $out != *"--timeout is now --awake-max-duration"* ]]; then
+  if [[ $out != *"use --awake-max-duration instead of --timeout"* ]]; then
     fail start_rejects_bad_values "--timeout should point at --awake-max-duration: $out"
     return
   fi
   out=$("${CLAFF[@]}" start --display 2>&1)
-  if [[ $out != *"--display is now --keep-display-on"* ]]; then
+  if [[ $out != *"use --keep-display-on instead of --display"* ]]; then
     fail start_rejects_bad_values "--display should point at --keep-display-on: $out"
     return
   fi
   out=$("${CLAFF[@]}" kill-mine 2>&1)
-  if [[ $out != *"kill-mine is now kill-session"* ]]; then
+  if [[ $out != *"use kill-session instead of kill-mine"* ]]; then
     fail start_rejects_bad_values "kill-mine should point at kill-session: $out"
     return
   fi
@@ -680,18 +778,30 @@ test_json_without_jq_fails() {
   pass json_without_jq_fails
 }
 
+# Prints what emoji_for gives for each of its keys, one per line. The keys
+# come from bash's own listing of the function, whatever the source's layout.
+emoji_for_every_key() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT_DIR}/bin/claffeinate"
+    local key
+    for key in $(declare -f emoji_for | sed -n 's/^ *\([a-z][a-z |-]*\))$/\1/p' | tr '|' ' '); do
+      printf '%s\n' "$(emoji_for "$key")"
+    done
+  )
+}
+
 # Every emoji is one code point, drawn 2 columns wide everywhere.
 test_emoji_are_terminal_safe() {
   local list
-  list=$(sed -n '/^emoji_for() {/,/^}/p' "${ROOT_DIR}/bin/claffeinate" |
-    sed -n "s/.*printf '\\(..*\\)' ;;/\\1/p")
+  list=$(emoji_for_every_key)
   if [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" -lt 10 ]; then
     fail emoji_are_terminal_safe "found too few emoji in emoji_for: $list"
     return
   fi
   if ! printf '%s\n' "$list" | python3 -c '
 import sys, unicodedata
-bad = [l for l in sys.stdin.read().split() if len(l) != 1 or unicodedata.east_asian_width(l) != "W" or unicodedata.category(l) != "So"]
+bad = [l for l in sys.stdin.read().split("\n")[:-1] if len(l) != 1 or unicodedata.east_asian_width(l) != "W" or unicodedata.category(l) != "So"]
 sys.exit(1 if bad else 0)'; then
     fail emoji_are_terminal_safe "an emoji isn't a single wide symbol: $list"
     return
@@ -965,44 +1075,84 @@ test_hook_noop_without_caffeinate() {
   pass hook_noop_without_caffeinate
 }
 
-# Every hooks.json entry runs the hook with an action it handles.
+# Runs hooks.json's command for event $1 as Claude Code would, with payload
+# $2 from claude $3.
+run_hooks_json() {
+  local command
+  command=$(jq -r --arg e "$1" '.hooks[$e][0].hooks[0].command' "${ROOT_DIR}/hooks/hooks.json")
+  printf '%s' "$2" | CLAUDE_PLUGIN_ROOT="$ROOT_DIR" CLAUDE_PID="$3" "$BASH" -c "$command" 2>&1
+}
+
+# Each hooks.json entry, run as written, starts or ends the hold its event
+# stands for.
 test_hooks_json_structure() {
+  needs_exec hooks_json_structure || return
   local hooks_json="${ROOT_DIR}/hooks/hooks.json"
   local known="UserPromptSubmit SubagentStart SubagentStop PostToolUse Stop StopFailure SessionEnd"
-  # shellcheck disable=SC2016 # the literal text hooks.json holds
-  local prefix='bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" '
-  local event command timeout action seen=""
-  while IFS=$'\t' read -r event command timeout; do
-    if [[ " $known " != *" $event "* ]]; then
-      fail hooks_json_structure "unexpected hook event: $event"
-      return
-    fi
-    seen+=" $event"
-    if [[ $command != "$prefix"* ]]; then
-      fail hooks_json_structure "$event runs an unexpected command: $command"
-      return
-    fi
-    action="${command#"$prefix"}"
-    if ! grep -Eq "^  ([a-z-]+ \| )*${action}( \| [a-z-]+)*\)" "$HOOK"; then
-      fail hooks_json_structure "$event uses action '$action', which the hook does not handle"
-      return
-    fi
-    # Must outlast start's wait for the holder's lock, about 10 seconds.
+  local events event timeout
+  events=$(jq -r '.hooks | keys[]' "$hooks_json" | sort | tr '\n' ' ')
+  if [ "$events" != "$(tr ' ' '\n' <<<"$known" | sort | tr '\n' ' ')" ]; then
+    fail hooks_json_structure "hooks.json should hook exactly $known: $events"
+    return
+  fi
+  # Must outlast start's wait for the holder's lock, about 10 seconds.
+  while IFS=$'\t' read -r event timeout; do
     if [ "$timeout" -lt 15 ]; then
       fail hooks_json_structure "$event times out after ${timeout}s, under 15s"
       return
     fi
-  done < <(jq -r '.hooks | to_entries[] | .key as $e | .value[].hooks[] | [$e, .command, .timeout] | @tsv' "$hooks_json")
-  for event in $known; do
-    if [[ " $seen " != *" $event "* ]]; then
-      fail hooks_json_structure "no hook for $event"
-      return
-    fi
-  done
+  done < <(jq -r '.hooks | to_entries[] | .key as $e | .value[].hooks[] | [$e, .timeout] | @tsv' "$hooks_json")
   if [ "$(jq -r '.hooks.PostToolUse[0].matcher' "$hooks_json")" != Bash ]; then
     fail hooks_json_structure "PostToolUse should match only Bash"
     return
   fi
+
+  local sid="${RUN}-hooksjson" task="bhj7k2" claude tasks shell
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+  if [ "$(count_holds "$sid" turn)" != 1 ]; then
+    fail hooks_json_structure "UserPromptSubmit should start the turn's hold"
+    return
+  fi
+  run_hooks_json SubagentStart "{\"session_id\":\"$sid\",\"agent_id\":\"a1\"}" "$claude"
+  if [ "$(count_holds "$sid" subagent-a1)" != 1 ]; then
+    fail hooks_json_structure "SubagentStart should start the subagent's hold"
+    return
+  fi
+  run_hooks_json SubagentStop "{\"session_id\":\"$sid\",\"agent_id\":\"a1\"}" "$claude"
+  if ! wait_gone "$sid" subagent-a1 3; then
+    fail hooks_json_structure "SubagentStop should end the subagent's hold"
+    return
+  fi
+  for event in Stop StopFailure; do
+    run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+    run_hooks_json "$event" "{\"session_id\":\"$sid\"}" "$claude"
+    if ! wait_gone "$sid" turn 3; then
+      fail hooks_json_structure "$event should end the turn's hold"
+      return
+    fi
+  done
+  # This test shell plays claude, as in hook_background_shell.
+  tasks="${BASE}/claude-tmp/${sid}/tasks"
+  mkdir -p "$tasks"
+  (exec /bin/sleep 600) </dev/null >"${tasks}/${task}.output" 2>/dev/null &
+  shell=$!
+  FAKES+=("$shell")
+  run_hooks_json PostToolUse "{\"session_id\":\"$sid\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\",\"run_in_background\":true},\"tool_response\":{\"backgroundTaskId\":\"$task\"}}" "$$"
+  if [ "$(count_holds "$sid" "shell-$task")" != 1 ]; then
+    kill "$shell"
+    fail hooks_json_structure "PostToolUse on a background Bash should start the shell's hold"
+    return
+  fi
+  run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+  run_hooks_json SessionEnd "{\"session_id\":\"$sid\",\"reason\":\"exit\"}" "$claude"
+  if ! wait_gone "$sid" "" 3; then
+    kill "$shell"
+    fail hooks_json_structure "SessionEnd should end every hold"
+    return
+  fi
+  kill "$shell"
   pass hooks_json_structure
 }
 
@@ -1289,16 +1439,33 @@ test_battery_capacities_move() {
   pass battery_capacities_move
 }
 
+# The lid guard runs through sudo -n only commands the printed rule allows.
 test_sudoers_rule() {
-  local out
+  needs_exec sudoers_rule || return
+  local out allowed sid="${RUN}-sudoers" call calls
   out=$("${CLAFF[@]}" sudoers)
-  # Each command the script runs has to be spelled as the rule allows it.
-  # shellcheck disable=SC2016 # the script's own text, $1 unexpanded
-  if [[ $out != *"$(id -un) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"* ]] ||
-    ! grep -q 'sudo -n /usr/bin/pmset -a disablesleep "$1"' "${ROOT_DIR}/bin/claffeinate"; then
-    fail sudoers_rule "the rule and the command differ: $out"
+  if [[ $out != *"$(id -un) ALL=(root) NOPASSWD: "* ]]; then
+    fail sudoers_rule "the rule should let $(id -un) run its commands without a password: $out"
     return
   fi
+  allowed=", ${out##*NOPASSWD: }, "
+  lid_reset
+  lid_claude
+  lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" "" 5
+  lid_wait_call 'disablesleep 0'
+  calls=$(lid_calls)
+  if [ "$(printf '%s\n' "$calls" | grep -c .)" -lt 2 ]; then
+    fail sudoers_rule "a lid hold should set and clear disablesleep through sudo: $calls"
+    return
+  fi
+  while IFS= read -r call; do
+    if [[ $call != "sudo -n "* ]] || [[ $allowed != *", ${call#sudo -n }, "* ]]; then
+      fail sudoers_rule "'$call' isn't sudo -n with a command the rule allows: $out"
+      return
+    fi
+  done <<<"$calls"
   pass sudoers_rule
 }
 
@@ -1569,6 +1736,8 @@ TESTS=(
   kill_session
   kill_orphans
   config_precedence
+  shipped_defaults
+  unknown_setting_refused
   start_rejects_bad_values
   per_command_help
   json_parses

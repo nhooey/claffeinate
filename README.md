@@ -126,8 +126,8 @@ you turn that on under `/plugin` → Marketplaces. To update by hand:
 ```
 
 Run `/reload-plugins` in every open session: a session keeps the hooks it
-loaded until then. After updating from 0.2.0, `claffeinate kill-orphans`
-stops 0.2.0's instances.
+loaded until then. `claffeinate kill-orphans` also stops any instances
+that 0.2.0 started.
 
 **Uninstalling.** Run `/plugin uninstall claffeinate@claffeinate`, then
 `claffeinate kill-session` in a session that still has holds.
@@ -220,7 +220,7 @@ still turns off, unless you pass `--keep-display-on`.
 | `--keep-display-on`             | keeps the display on too               |
 
 DURATION is a number with units, largest first: `30s`, `45m`, `1h30m`, `2d`.
-A bare number is seconds. `--timeout` is now `--awake-max-duration`.
+A bare number is seconds.
 
 ```sh
 claffeinate start --keep-display-on --awake-max-duration 1h30m   # a presentation
@@ -260,12 +260,16 @@ UTF-8 turns them off; each column keeps its width, so nothing moves.
 
 ### Settings
 
-| Setting              | Default | Variable                         |
-| -------------------- | ------- | -------------------------------- |
-| `awake-max-duration` | `4h`    | `CLAFFEINATE_AWAKE_MAX_DURATION` |
-| `awake-min-battery`  | `20`    | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
-| `awake-lid-closed`   | `on`    | `CLAFFEINATE_AWAKE_LID_CLOSED`   |
-| `emoji`              | `on`    | `CLAFFEINATE_EMOJI`              |
+Each setting's default, with what it does, is in
+[`share/claffeinate/defaults.conf`](share/claffeinate/defaults.conf), which
+ships with claffeinate; `claffeinate config --defaults` prints it.
+
+| Setting              | Variable                         |
+| -------------------- | -------------------------------- |
+| `awake-max-duration` | `CLAFFEINATE_AWAKE_MAX_DURATION` |
+| `awake-min-battery`  | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
+| `awake-lid-closed`   | `CLAFFEINATE_AWAKE_LID_CLOSED`   |
+| `emoji`              | `CLAFFEINATE_EMOJI`              |
 
 The strongest layer wins:
 
@@ -277,15 +281,29 @@ The strongest layer wins:
    then `.claude/settings.json`, then `~/.claude/settings.json`, then from
    the environment it was started in
 4. the config file, `~/.config/claffeinate/config`
-5. the default
+5. the shipped defaults file
 
-Both files hold `setting = value` lines. A hold keeps the settings it
-started with; `claffeinate config` shows each value and its layer.
+The files hold `setting = value` lines. Put only the settings you change
+in your config file, not a copy of the defaults, so new defaults reach you
+when you update. A line that names no setting is an error, so a typo can't
+silently do nothing. A hold keeps the settings it started with;
+`claffeinate config` shows each value and its layer.
 
 ```sh
 claffeinate config set --global awake-min-battery 30
 claffeinate config set --global awake-lid-closed off   # let the lid sleep the Mac
 ```
+
+These variables move claffeinate's files or change how often a hold
+checks its limits:
+
+| Variable                     | Default                                            |
+| ---------------------------- | -------------------------------------------------- |
+| `CLAFFEINATE_CONFIG`         | `${XDG_CONFIG_HOME:-~/.config}/claffeinate/config` |
+| `CLAFFEINATE_STATE_DIR`      | `${XDG_STATE_HOME:-~/.local/state}/claffeinate`    |
+| `CLAFFEINATE_RUN_DIR`        | `/tmp/claffeinate-$UID/`, ending in `/`            |
+| `CLAFFEINATE_LOG`            | `~/Library/Logs/claffeinate.log`                   |
+| `CLAFFEINATE_WATCH_INTERVAL` | `60`, in seconds                                   |
 
 ### Closing the lid
 
@@ -478,14 +496,20 @@ checkout. The script reads the hook's JSON payload on stdin, takes
 
 ## Development
 
+Work inside the dev shell (`nix develop`); `menu` lists its commands. They
+are tokens of one tool, `scripts/claff-dev`, and `claff-dev --help` lists
+them all:
+
 ```sh
-tests/test.sh [TEST...]                # acceptance tests, or only those named
-nix flake check                        # shellcheck and the tests
-claude plugin validate --strict .      # the manifests (validate-plugin in the dev shell)
-claude --plugin-dir . -p "…"           # try the plugin from this checkout
+run-tests [TEST...]     # acceptance tests, or only those named
+lint                    # shellcheck
+check                   # nix flake check: shellcheck and all the tests
+validate-plugin         # the manifests
+try-plugin "…"          # claude -p with the plugin from this checkout
+claff-dev build         # the package
 ```
 
-`--plugin-dir` takes over from an installed copy of the same plugin for
+`try-plugin` takes over from an installed copy of the same plugin for
 that session.
 
 To release, raise `version` in `.claude-plugin/plugin.json`. Installed

@@ -55,8 +55,8 @@ session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--li
   subshell before `exec caffeinate`) carry its argv until they exec.
 - The target of `-w` is `--wait-pid` if given, else the claude PID, else
   none.
-- 0.2.0's tagged caffeinates had a symlink directory before the name; the
-  pattern `^(/[^ ]*/)?caffeinate--claffeinate--` matches both.
+- The pattern `^(/[^ ]*/)?caffeinate--claffeinate--` also matches a
+  symlink directory before the name, as in 0.2.0's tags.
 
 ### The watcher (`cmd_watch`)
 
@@ -139,15 +139,18 @@ An unknown flag exits 2 naming `claffeinate COMMAND --help`.
 | `resume`       | Delete the rules within the scope and send `USR2` to every watcher. Exit 3 if none. |
 | `list`         | `PID SESSION HOLDER CLAUDE_PID alive\|paused\|dead STARTED MAX FLOOR LID`, tab-separated; a terminal gets aligned columns under headers and a rule. `dead`: no `caffeinate`, or the claude PID is gone.                                                                                                                                                                                                                                                                                                                                                                                  |
 | `status`       | Below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `config`       | Each setting's value and layer, then the session file, config file and log paths. `set` validates the value; `set`/`unset` on a session also record `claude-pid = $CLAUDE_PID`.                                                                                                                                                                                                                                                                                                                                    |
+| `config`       | Each setting's value and layer, then the session file, config file, defaults file and log paths; `--defaults` prints the defaults file. `set` validates the value; `set`/`unset` on a session also record `claude-pid = $CLAUDE_PID`.                                                                                                                                                                                                                                                                                                                                    |
 
 Durations: a bare number of seconds, or `<n>d<n>h<n>m<n>s` parts in that
 order, total above 0. Battery: an integer 0–100.
 
 ## Settings
 
-`awake-max-duration` (4h), `awake-min-battery` (20), `awake-lid-closed` (on),
-`emoji` (on). Layers, strongest first, in `resolve_setting`:
+`awake-max-duration`, `awake-min-battery`, `awake-lid-closed` and `emoji`,
+each with its default and a comment in `share/claffeinate/defaults.conf`.
+The script finds that file as `../share/claffeinate/defaults.conf` from its
+own path with symlinks resolved, and holds no default of its own. Layers,
+strongest first, in `resolve_setting`:
 
 1. the flag
 2. `$CLAFFEINATE_STATE_DIR/sessions/<sid>.conf`
@@ -155,11 +158,14 @@ order, total above 0. Battery: an integer 0–100.
    `CLAFFEINATE_AWAKE_LID_CLOSED`, `CLAFFEINATE_EMOJI` (Claude Code fills these from `--settings`, project
    and user `settings.json` `env`, then the launch environment)
 4. `$CLAFFEINATE_CONFIG`, default `$XDG_CONFIG_HOME/claffeinate/config`
-5. the default
+5. the defaults file
 
 Files hold `setting = value` lines, `#` comments, last one wins, parsed
 with `awk` and never sourced. A bad value in layers 2–4 warns on stderr and
-falls through; a bad flag exits 2.
+falls through; a bad flag exits 2. `start`, `status` and `config` exit 2 on
+a line in the defaults, config or session file that names no setting (a
+session file may also hold `claude-pid`), or when the defaults file is
+missing; the commands that end holds never read the files.
 
 ## Paths
 
@@ -345,6 +351,8 @@ build.
 | `kill_session`                | ends the session's holds as `killed`, not another session's; exits 3 with none          |
 | `kill_orphans`                | each orphan kind and a dead session file; `--dry-run` stops nothing; a live hold is untouched |
 | `config_precedence`           | default, config, variable, session and flag in order; a bad variable warns and falls through; `set` needs a layer and a valid value; the tag records what applied |
+| `shipped_defaults`            | the defaults file names every setting, each under a comment; `config --defaults` prints it; no or an empty config gives the defaults; a symlinked script finds it |
+| `unknown_setting_refused`     | a misspelt key or a line without `=` makes `config`, `status` and `start` exit 2; `kill-session` ignores it; a session file allows `claude-pid` only |
 | `start_rejects_bad_values`    | bad durations, floors, holders, sessions and PIDs exit 2; `--timeout` names its successor |
 | `per_command_help`            | every command's `--help`, `help COMMAND` and unknown flag                               |
 | `json_parses`                 | `list --json` and `status --json` parse, with the hold and the macOS block              |

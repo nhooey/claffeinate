@@ -3,5 +3,8 @@
 /.direnv/
 
 # Project-scope skill installs from the dev shell's reconcile startup hook.
-# Symlinks into the Nix store, not source.
+# Symlinks into the Nix store, not source; the skills' preferences files
+# beside them are the project's own.
+/.agents/skills/*
+!/.agents/skills/*.preferences.md
 /.claude/skills/
