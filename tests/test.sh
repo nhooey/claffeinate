@@ -629,6 +629,13 @@ emoji on default" ] || {
     fail "$name" "a symlinked script should find the defaults file: $out"
     return
   }
+  # So does the script reached through a symlink to its directory.
+  ln -s "${ROOT_DIR}/bin" "${BASE}/link-dir"
+  out=$(bash "${BASE}/link-dir/claffeinate" config --defaults 2>&1)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "a script in a symlinked directory should find the defaults file: $out"
+    return
+  }
   pass "$name"
 }
 
