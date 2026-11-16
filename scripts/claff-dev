@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# claff-dev: the developer commands for this repository, one tool with a
+# command token per job. Run `claff-dev --help` for the list.
+#
+# Each token builds the command it would run into CMD; `--dry-run` prints
+# that command instead of running it. Scripts run through `bash` rather than
+# being exec'd directly, because sandboxed macOS Nix builds can deny exec on
+# the build volume.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The shell files that lint checks and treefmt formats.
+SHELL_FILES=(
+  bin/claffeinate
+  hooks/claffeinate-hook.sh
+  scripts/claff-dev
+  tests/test.sh
+  tests/claff-dev.sh
+)
+
+usage() {
+  cat <<'EOF'
+Usage: claff-dev [--dry-run] COMMAND [ARGS...]
+
+Commands:
+  lint                 Run shellcheck on the repository's shell files
+  test [TEST...]       Run the acceptance tests, or only those named
+  build [ARGS...]      Build the package with nix build
+  validate-plugin      Validate the plugin and marketplace manifests
+  try-plugin PROMPT... Run claude -p with the plugin loaded from this checkout
+
+Options:
+  -n, --dry-run        Print the command instead of running it
+  -h, --help           Show this help, or a command's help after it
+
+Exit status: the command's own, or 2 for a usage error.
+EOF
+}
+
+command_help() {
+  case "$1" in
+  lint) echo "Usage: claff-dev lint
+Run shellcheck on: ${SHELL_FILES[*]}" ;;
+  test) echo "Usage: claff-dev test [TEST...]
+Run tests/test.sh: every acceptance test, or only those named." ;;
+  build) echo "Usage: claff-dev build [ARGS...]
+Run nix build on this checkout; ARGS go to nix build." ;;
+  validate-plugin) echo "Usage: claff-dev validate-plugin
+Run claude plugin validate --strict on this checkout." ;;
+  try-plugin) echo "Usage: claff-dev try-plugin PROMPT...
+Run claude --plugin-dir <checkout> -p PROMPT..., to try the plugin's hooks and
+skills from this checkout without installing it." ;;
+  esac
+}
+
+die_usage() {
+  echo "claff-dev: $1" >&2
+  echo "Run 'claff-dev --help' for usage." >&2
+  exit 2
+}
+
+# plan COMMAND [ARGS...]: set CMD to the command line COMMAND runs.
+plan() {
+  local token="$1"
+  shift
+  case "$token" in
+  lint)
+    [ $# -eq 0 ] || die_usage "lint takes no arguments"
+    CMD=(shellcheck)
+    local f
+    for f in "${SHELL_FILES[@]}"; do CMD+=("$ROOT/$f"); done
+    ;;
+  test) CMD=(bash "$ROOT/tests/test.sh" "$@") ;;
+  build) CMD=(nix build "$ROOT" "$@") ;;
+  validate-plugin)
+    [ $# -eq 0 ] || die_usage "validate-plugin takes no arguments"
+    CMD=(claude plugin validate --strict "$ROOT")
+    ;;
+  try-plugin)
+    [ $# -gt 0 ] || die_usage "try-plugin needs a prompt"
+    CMD=(claude --plugin-dir "$ROOT" -p "$@")
+    ;;
+  *) die_usage "unknown command: $token" ;;
+  esac
+}
+
+main() {
+  local dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    -n | --dry-run) dry_run=1 ;;
+    -h | --help)
+      usage
+      return 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die_usage "unknown option: $1" ;;
+    *) break ;;
+    esac
+    shift
+  done
+  [ $# -gt 0 ] || die_usage "no command given"
+
+  local token="$1"
+  if [ $# -ge 2 ] && { [ "$2" = -h ] || [ "$2" = --help ]; }; then
+    case "$token" in
+    lint | test | build | validate-plugin | try-plugin) command_help "$token" ;;
+    *) die_usage "unknown command: $token" ;;
+    esac
+    return 0
+  fi
+
+  plan "$@"
+  if [ "$dry_run" -eq 1 ]; then
+    printf '%q' "${CMD[0]}"
+    printf ' %q' "${CMD[@]:1}"
+    printf '\n'
+    return 0
+  fi
+  "${CMD[@]}"
+}
+
+main "$@"

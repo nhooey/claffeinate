@@ -18,10 +18,16 @@ Work inside the dev shell (`nix develop`); entering it also installs the
 project's skills into `.agents/skills/`.
 
 ```sh
-nix flake check                        # shellcheck and the acceptance tests
-tests/test.sh [TEST...]                # acceptance tests, or only those named
-nix build                              # the package
-claude plugin validate --strict .      # the manifests
+check                   # nix flake check: shellcheck and all the tests
+run-tests [TEST...]     # acceptance tests, or only those named
+lint                    # shellcheck
+validate-plugin         # the manifests
+try-plugin "…"          # claude -p with the plugin from this checkout
+claff-dev build         # the package
 ```
+
+Each is a token of `scripts/claff-dev` (`claff-dev --help`); add a new
+developer command there, with a test in `tests/claff-dev.sh` and a menu
+entry in `flake.nix`.
 
 macOS only: the script relies on `caffeinate`, `pmset` and BSD `ps -E`.

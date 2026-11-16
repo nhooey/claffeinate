@@ -92,8 +92,11 @@
               enable = true;
               indent_size = 2;
             };
-            # shfmt matches by extension, and the script has none.
-            settings.formatter.shfmt.includes = [ "bin/claffeinate" ];
+            # shfmt matches by extension, and these scripts have none.
+            settings.formatter.shfmt.includes = [
+              "bin/claffeinate"
+              "scripts/claff-dev"
+            ];
           };
 
           checks = {
@@ -103,9 +106,15 @@
                   nativeBuildInputs = [ pkgs.shellcheck ];
                 }
                 ''
-                  shellcheck ${./bin/claffeinate} ${./hooks/claffeinate-hook.sh} ${./tests/test.sh}
+                  bash ${./.}/scripts/claff-dev lint
                   touch $out
                 '';
+
+            # The dev tool's argument parsing, through --dry-run and --help.
+            claff-dev = pkgs.runCommand "claffeinate-claff-dev-tests" { nativeBuildInputs = [ pkgs.bash ]; } ''
+              bash ${./.}/tests/claff-dev.sh
+              touch $out
+            '';
 
             # Acceptance tests. Run against the source script (not the wrapped
             # binary): json_without_jq_fails stubs jq via PATH, which the
@@ -135,7 +144,7 @@
                   # build-private run dir.
                   export CLAFFEINATE_RUN_DIR="$PWD/run/"
                   export CLAFFEINATE_TESTS_REQUIRE_EXEC=1
-                  bash tests/test.sh
+                  bash scripts/claff-dev test
                   touch $out
                 '';
           };
@@ -145,7 +154,8 @@
           # command trio (check / fmt / update-flake), and the skills commands
           # (reap-skills / update-skills-devshell). Only claffeinate-specific
           # packages and commands are set here; both are list options, so they
-          # merge onto the module's rather than replacing them.
+          # merge onto the module's rather than replacing them. Each command
+          # is a token of scripts/claff-dev, which holds the bodies.
           devshells.default = {
             packages = [
               pkgs.bash
@@ -157,25 +167,34 @@
             commands = [
               {
                 category = "dev";
-                name = "lint";
-                help = "Run shellcheck on the script, the plugin hook and the tests";
-                command = ''
-                  set -eu
-                  shellcheck "$PRJ_ROOT/bin/claffeinate" \
-                    "$PRJ_ROOT/hooks/claffeinate-hook.sh" "$PRJ_ROOT/tests/test.sh"
-                '';
+                name = "claff-dev";
+                help = "The developer commands as one tool; claff-dev --help lists them";
+                command = ''exec "$PRJ_ROOT/scripts/claff-dev" "$@"'';
               }
               {
                 category = "dev";
-                name = "test";
-                help = "Run the acceptance test suite";
-                command = ''exec "$PRJ_ROOT/tests/test.sh" "$@"'';
+                name = "lint";
+                help = "Run shellcheck on the repository's shell files";
+                command = ''exec "$PRJ_ROOT/scripts/claff-dev" lint "$@"'';
+              }
+              {
+                category = "dev";
+                # Not "test": the shell's test builtin would shadow it.
+                name = "run-tests";
+                help = "Run the acceptance tests, or only those named";
+                command = ''exec "$PRJ_ROOT/scripts/claff-dev" test "$@"'';
+              }
+              {
+                category = "dev";
+                name = "try-plugin";
+                help = "Run claude -p with the plugin loaded from this checkout";
+                command = ''exec "$PRJ_ROOT/scripts/claff-dev" try-plugin "$@"'';
               }
               {
                 category = "dev";
                 name = "validate-plugin";
                 help = "Validate the plugin and marketplace manifests with Claude Code";
-                command = ''exec claude plugin validate --strict "$PRJ_ROOT"'';
+                command = ''exec "$PRJ_ROOT/scripts/claff-dev" validate-plugin "$@"'';
               }
             ];
           };
