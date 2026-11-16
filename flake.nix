@@ -106,10 +106,9 @@
 
             # Acceptance tests. Run against the source script (not the wrapped
             # binary): json_without_jq_fails stubs jq via PATH, which the
-            # wrapper's hardcoded PATH would defeat. The build sandbox blocks
-            # caffeinate(1), /bin/sleep and ps(1), so every test that calls
-            # needs_exec skips here; tests/test.sh outside the sandbox runs
-            # them all.
+            # wrapper's hardcoded PATH would defeat. Every test runs here: the
+            # build denies exec of the setuid /bin/ps, so nixpkgs' ps comes
+            # first on PATH, ahead of the macOS tools.
             tests =
               pkgs.runCommand "claffeinate-tests"
                 {
@@ -118,6 +117,7 @@
                     pkgs.jq
                     pkgs.python3
                     pkgs.coreutils
+                    pkgs.ps
                   ];
                 }
                 ''
@@ -125,12 +125,13 @@
                   cp -r ${./.} ./src
                   chmod -R u+w ./src
                   cd ./src
-                  # Macros + caffeinate(1) live in /usr/bin and /bin on macOS;
-                  # add them since the Nix sandbox PATH lists only build inputs.
-                  export PATH="/usr/bin:/bin:$PATH"
+                  # caffeinate(1), pmset, lsof and the other macOS tools live in
+                  # /usr/bin, /usr/sbin and /bin.
+                  export PATH="${pkgs.ps}/bin:/usr/bin:/usr/sbin:/bin:$PATH"
                   # Keep the build off the shared /tmp/claffeinate-$UID/: use a
                   # build-private run dir.
                   export CLAFFEINATE_RUN_DIR="$PWD/run/"
+                  export CLAFFEINATE_TESTS_REQUIRE_EXEC=1
                   bash tests/test.sh
                   touch $out
                 '';
