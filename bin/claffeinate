@@ -410,6 +410,45 @@ conf_get() {
   printf '%s\n' "$v"
 }
 
+# Prints the key of each line that isn't blank or a comment: the text
+# before its "=", or the whole line when it has none.
+conf_keys() {
+  awk '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      line = $0
+      eq = index(line, "=")
+      key = eq ? substr(line, 1, eq - 1) : line
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      print key
+    }
+  ' "$1"
+}
+
+# Fails on a key in file $1 that is neither a setting nor one of the extra
+# keys $2, so a misspelt setting never silently does nothing.
+conf_check() {
+  local file="$1" extra="${2:-}" key
+  [ -f "$file" ] || return 0
+  while IFS= read -r key; do
+    is_setting "$key" && continue
+    case " $extra " in *" $key "*) continue ;; esac
+    die "$file: unknown setting: $key (one of: $SETTINGS)" 2
+  done < <(conf_keys "$file")
+}
+
+# Fails unless the defaults file is there, and it, the config file and
+# session $1's file hold only known settings. stop, kill-session and the
+# other commands that end holds never call this, so a bad file can't keep
+# a hold running.
+check_config() {
+  [ -f "$DEFAULTS_FILE" ] || die "missing the defaults file: $DEFAULTS_FILE"
+  conf_check "$DEFAULTS_FILE"
+  conf_check "$CONFIG_FILE"
+  # A session file also records its claude PID.
+  [ -z "${1:-}" ] || conf_check "$(session_conf "$1")" claude-pid
+}
+
 conf_set() {
   local file="$1" key="$2" value="$3" tmp
   mkdir -p "$(dirname "$file")"
@@ -1120,7 +1159,8 @@ Layers, strongest first:
            where claffeinate is installed
 
 All three files hold "setting = value" lines. The session and config
-files name only the settings they change. A setting takes effect for holds started after the change.
+files name only the settings they change; one that names anything else
+is an error. A setting takes effect for holds started after the change.
 
 Options:
   --defaults    print the shipped defaults file, with its comments
@@ -1249,6 +1289,7 @@ cmd_start() {
   [[ $claude =~ ^[0-9]+$ ]] || die "--claude-pid: not a PID: $claude" 2
   [ -z "$wait_pid" ] || [[ $wait_pid =~ ^[1-9][0-9]*$ ]] || die "--wait-pid: not a PID: $wait_pid" 2
 
+  check_config "$sid"
   resolve_limits "$max_flag" "$floor_flag" "$lid_flag" "$sid"
   local max="$LIM_MAX" floor="$LIM_FLOOR" lid=0
   [ "$LIM_LID" = off ] || lid=1
@@ -2001,6 +2042,7 @@ cmd_config() {
   show)
     [ "${#args[@]}" -eq 0 ] || die "config: unexpected argument: ${args[0]}" 2
     [ -n "$sid" ] || sid="${CLAUDE_CODE_SESSION_ID:-}"
+    check_config "$sid"
     local name shown
     table_reset
     table_row SETTING VALUE FROM
@@ -2096,6 +2138,7 @@ main() {
   stop) cmd_stop "$@" ;;
   list) cmd_list "$@" ;;
   status)
+    check_config "${CLAUDE_CODE_SESSION_ID:-}"
     resolve_emoji
     # Column widths count characters, so measure them in UTF-8 whatever
     # the locale; the locale only decides whether emoji show.

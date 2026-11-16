@@ -632,6 +632,47 @@ emoji on default" ] || {
   pass "$name"
 }
 
+test_unknown_setting_refused() {
+  local name=unknown_setting_refused cfg="${BASE}/typo-config" sid="${RUN}-typo" out rc cmd
+  printf 'awake-max-duraton = 8h\n' >"$cfg"
+  for cmd in "config" "status" "start --session $sid --claude-pid 0"; do
+    # shellcheck disable=SC2086
+    out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" $cmd 2>&1)
+    rc=$?
+    [ "$rc" = 2 ] && [[ $out == *"unknown setting: awake-max-duraton"* ]] || {
+      "${CLAFF[@]}" kill-session --session "$sid" >/dev/null 2>&1
+      fail "$name" "$cmd should refuse a misspelt setting: rc=$rc $out"
+      return
+    }
+  done
+  # Commands that end holds still work, so a typo never keeps one running.
+  out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" kill-session --session "$sid" 2>&1)
+  [[ $out != *"unknown setting"* ]] || {
+    fail "$name" "kill-session should ignore the config file: $out"
+    return
+  }
+  printf 'awake-max-duration 8h\n' >"$cfg"
+  out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" config 2>&1)
+  [ $? = 2 ] && [[ $out == *"unknown setting: awake-max-duration 8h"* ]] || {
+    fail "$name" "a line without = should be refused: $out"
+    return
+  }
+  # A session file may record its claude PID, and nothing else unknown.
+  CLAUDE_PID=$$ "${CLAFF[@]}" config set --session "$sid" emoji off >/dev/null
+  "${CLAFF[@]}" config --session "$sid" >/dev/null 2>&1 || {
+    fail "$name" "a session file's claude-pid should be accepted"
+    return
+  }
+  printf 'colour = on\n' >>"${CLAFFEINATE_STATE_DIR}/sessions/${sid}.conf"
+  out=$("${CLAFF[@]}" config --session "$sid" 2>&1)
+  [ $? = 2 ] && [[ $out == *"unknown setting: colour"* ]] || {
+    fail "$name" "a session file's unknown setting should be refused: $out"
+    return
+  }
+  rm -f "${CLAFFEINATE_STATE_DIR}/sessions/${sid}.conf"
+  pass "$name"
+}
+
 test_start_rejects_bad_values() {
   local bad out rc
   for bad in "--awake-max-duration 1x" "--awake-max-duration 30ms" "--awake-max-duration 1m1h" \
@@ -1696,6 +1737,7 @@ TESTS=(
   kill_orphans
   config_precedence
   shipped_defaults
+  unknown_setting_refused
   start_rejects_bad_values
   per_command_help
   json_parses
