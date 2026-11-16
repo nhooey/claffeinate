@@ -585,6 +585,53 @@ test_config_precedence() {
   pass config_precedence
 }
 
+test_shipped_defaults() {
+  local name=shipped_defaults defaults="${ROOT_DIR}/share/claffeinate/defaults.conf"
+  local keys settings out empty="${BASE}/empty-config" link="${BASE}/link-bin"
+  # Complete: the file's keys are exactly the settings the script knows.
+  keys=$(awk -F= '!/^[[:space:]]*(#|$)/ { gsub(/[[:space:]]/, "", $1); print $1 }' "$defaults" | sort)
+  # shellcheck source=/dev/null disable=SC2086,SC2153
+  settings=$(source "${ROOT_DIR}/bin/claffeinate" && printf '%s\n' $SETTINGS | sort)
+  [ -n "$keys" ] && [ "$keys" = "$settings" ] || {
+    fail "$name" "the defaults file's keys '$keys' should be the settings '$settings'"
+    return
+  }
+  # Every setting has a comment right above it.
+  out=$(awk '!/^[[:space:]]*(#|$)/ && prev !~ /^#/ { print } { prev = $0 }' "$defaults")
+  [ -z "$out" ] || {
+    fail "$name" "uncommented settings: $out"
+    return
+  }
+  out=$("${CLAFF[@]}" config --defaults)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "config --defaults should print the shipped file"
+    return
+  }
+  # No config file, or an empty one, gives exactly the defaults.
+  : >"$empty"
+  for cfg in "${BASE}/no-such-config" "$empty"; do
+    out=$(env -u CLAFFEINATE_AWAKE_LID_CLOSED CLAFFEINATE_CONFIG="$cfg" \
+      bash -c "$(declare -p CLAFF); \"\${CLAFF[@]}\" config --session ${RUN}-defaults" |
+      awk 'NR > 1 && NF == 3 { print $1, $2, $3 }')
+    [ "$out" = "awake-max-duration 4h default
+awake-min-battery 20% default
+awake-lid-closed on default
+emoji on default" ] || {
+      fail "$name" "config $cfg should give the defaults: $out"
+      return
+    }
+  done
+  # A symlink to the script, as a ~/bin install makes, still finds the file.
+  mkdir -p "$link"
+  ln -s "${ROOT_DIR}/bin/claffeinate" "${link}/claffeinate"
+  out=$(bash "${link}/claffeinate" config --defaults 2>&1)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "a symlinked script should find the defaults file: $out"
+    return
+  }
+  pass "$name"
+}
+
 test_start_rejects_bad_values() {
   local bad out rc
   for bad in "--awake-max-duration 1x" "--awake-max-duration 30ms" "--awake-max-duration 1m1h" \
@@ -1648,6 +1695,7 @@ TESTS=(
   kill_session
   kill_orphans
   config_precedence
+  shipped_defaults
   start_rejects_bad_values
   per_command_help
   json_parses

@@ -71,6 +71,9 @@
             installPhase = ''
               runHook preInstall
               install -Dm755 bin/claffeinate $out/bin/claffeinate
+              # The script finds it as ../share/claffeinate/defaults.conf.
+              install -Dm644 share/claffeinate/defaults.conf \
+                $out/share/claffeinate/defaults.conf
               wrapProgram $out/bin/claffeinate \
                 --prefix PATH : ${lib.makeBinPath [ pkgs.jq ]}
               runHook postInstall

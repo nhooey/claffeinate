@@ -260,12 +260,16 @@ UTF-8 turns them off; each column keeps its width, so nothing moves.
 
 ### Settings
 
-| Setting              | Default | Variable                         |
-| -------------------- | ------- | -------------------------------- |
-| `awake-max-duration` | `4h`    | `CLAFFEINATE_AWAKE_MAX_DURATION` |
-| `awake-min-battery`  | `20`    | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
-| `awake-lid-closed`   | `on`    | `CLAFFEINATE_AWAKE_LID_CLOSED`   |
-| `emoji`              | `on`    | `CLAFFEINATE_EMOJI`              |
+Each setting's default, with what it does, is in
+[`share/claffeinate/defaults.conf`](share/claffeinate/defaults.conf), which
+ships with claffeinate; `claffeinate config --defaults` prints it.
+
+| Setting              | Variable                         |
+| -------------------- | -------------------------------- |
+| `awake-max-duration` | `CLAFFEINATE_AWAKE_MAX_DURATION` |
+| `awake-min-battery`  | `CLAFFEINATE_AWAKE_MIN_BATTERY`  |
+| `awake-lid-closed`   | `CLAFFEINATE_AWAKE_LID_CLOSED`   |
+| `emoji`              | `CLAFFEINATE_EMOJI`              |
 
 The strongest layer wins:
 
@@ -277,10 +281,12 @@ The strongest layer wins:
    then `.claude/settings.json`, then `~/.claude/settings.json`, then from
    the environment it was started in
 4. the config file, `~/.config/claffeinate/config`
-5. the default
+5. the shipped defaults file
 
-Both files hold `setting = value` lines. A hold keeps the settings it
-started with; `claffeinate config` shows each value and its layer.
+The files hold `setting = value` lines. Put only the settings you change
+in your config file, not a copy of the defaults, so new defaults reach you
+when you update. A hold keeps the settings it started with;
+`claffeinate config` shows each value and its layer.
 
 ```sh
 claffeinate config set --global awake-min-battery 30

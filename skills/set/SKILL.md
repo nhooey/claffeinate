@@ -10,13 +10,13 @@ The user wants to change a claffeinate setting for this session: `$ARGUMENTS`.
 The settings are:
 
 - `awake-max-duration`: the longest one hold keeps the Mac awake, such as
-  `8h` or `90m` (default `4h`)
+  `8h` or `90m`
 - `awake-min-battery`: the battery percent at which holds end; `0` never
-  (default `20`)
 - `awake-lid-closed`: `on` or `off`, whether holds keep the Mac awake with
-  its lid closed (default `on`; `on` needs the rule `claffeinate sudoers`
-  prints)
-- `emoji`: `on` or `off`, for the status output (default `on`)
+  its lid closed (`on` needs the rule `claffeinate sudoers` prints)
+- `emoji`: `on` or `off`, for the status output
+
+`claffeinate config --defaults` prints each setting's default.
 
 Run, with the Bash tool:
 
