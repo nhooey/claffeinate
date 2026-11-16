@@ -690,18 +690,30 @@ test_json_without_jq_fails() {
   pass json_without_jq_fails
 }
 
+# Prints what emoji_for gives for each of its keys, one per line. The keys
+# come from bash's own listing of the function, whatever the source's layout.
+emoji_for_every_key() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT_DIR}/bin/claffeinate"
+    local key
+    for key in $(declare -f emoji_for | sed -n 's/^ *\([a-z][a-z |-]*\))$/\1/p' | tr '|' ' '); do
+      printf '%s\n' "$(emoji_for "$key")"
+    done
+  )
+}
+
 # Every emoji is one code point, drawn 2 columns wide everywhere.
 test_emoji_are_terminal_safe() {
   local list
-  list=$(sed -n '/^emoji_for() {/,/^}/p' "${ROOT_DIR}/bin/claffeinate" |
-    sed -n "s/.*printf '\\(..*\\)' ;;/\\1/p")
+  list=$(emoji_for_every_key)
   if [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" -lt 10 ]; then
     fail emoji_are_terminal_safe "found too few emoji in emoji_for: $list"
     return
   fi
   if ! printf '%s\n' "$list" | python3 -c '
 import sys, unicodedata
-bad = [l for l in sys.stdin.read().split() if len(l) != 1 or unicodedata.east_asian_width(l) != "W" or unicodedata.category(l) != "So"]
+bad = [l for l in sys.stdin.read().split("\n")[:-1] if len(l) != 1 or unicodedata.east_asian_width(l) != "W" or unicodedata.category(l) != "So"]
 sys.exit(1 if bad else 0)'; then
     fail emoji_are_terminal_safe "an emoji isn't a single wide symbol: $list"
     return
@@ -975,44 +987,84 @@ test_hook_noop_without_caffeinate() {
   pass hook_noop_without_caffeinate
 }
 
-# Every hooks.json entry runs the hook with an action it handles.
+# Runs hooks.json's command for event $1 as Claude Code would, with payload
+# $2 from claude $3.
+run_hooks_json() {
+  local command
+  command=$(jq -r --arg e "$1" '.hooks[$e][0].hooks[0].command' "${ROOT_DIR}/hooks/hooks.json")
+  printf '%s' "$2" | CLAUDE_PLUGIN_ROOT="$ROOT_DIR" CLAUDE_PID="$3" "$BASH" -c "$command" 2>&1
+}
+
+# Each hooks.json entry, run as written, starts or ends the hold its event
+# stands for.
 test_hooks_json_structure() {
+  needs_exec hooks_json_structure || return
   local hooks_json="${ROOT_DIR}/hooks/hooks.json"
   local known="UserPromptSubmit SubagentStart SubagentStop PostToolUse Stop StopFailure SessionEnd"
-  # shellcheck disable=SC2016 # the literal text hooks.json holds
-  local prefix='bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" '
-  local event command timeout action seen=""
-  while IFS=$'\t' read -r event command timeout; do
-    if [[ " $known " != *" $event "* ]]; then
-      fail hooks_json_structure "unexpected hook event: $event"
-      return
-    fi
-    seen+=" $event"
-    if [[ $command != "$prefix"* ]]; then
-      fail hooks_json_structure "$event runs an unexpected command: $command"
-      return
-    fi
-    action="${command#"$prefix"}"
-    if ! grep -Eq "^  ([a-z-]+ \| )*${action}( \| [a-z-]+)*\)" "$HOOK"; then
-      fail hooks_json_structure "$event uses action '$action', which the hook does not handle"
-      return
-    fi
-    # Must outlast start's wait for the holder's lock, about 10 seconds.
+  local events event timeout
+  events=$(jq -r '.hooks | keys[]' "$hooks_json" | sort | tr '\n' ' ')
+  if [ "$events" != "$(tr ' ' '\n' <<<"$known" | sort | tr '\n' ' ')" ]; then
+    fail hooks_json_structure "hooks.json should hook exactly $known: $events"
+    return
+  fi
+  # Must outlast start's wait for the holder's lock, about 10 seconds.
+  while IFS=$'\t' read -r event timeout; do
     if [ "$timeout" -lt 15 ]; then
       fail hooks_json_structure "$event times out after ${timeout}s, under 15s"
       return
     fi
-  done < <(jq -r '.hooks | to_entries[] | .key as $e | .value[].hooks[] | [$e, .command, .timeout] | @tsv' "$hooks_json")
-  for event in $known; do
-    if [[ " $seen " != *" $event "* ]]; then
-      fail hooks_json_structure "no hook for $event"
-      return
-    fi
-  done
+  done < <(jq -r '.hooks | to_entries[] | .key as $e | .value[].hooks[] | [$e, .timeout] | @tsv' "$hooks_json")
   if [ "$(jq -r '.hooks.PostToolUse[0].matcher' "$hooks_json")" != Bash ]; then
     fail hooks_json_structure "PostToolUse should match only Bash"
     return
   fi
+
+  local sid="${RUN}-hooksjson" task="bhj7k2" claude tasks shell
+  claude=$(fake_process)
+  FAKES+=("$claude")
+  run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+  if [ "$(count_holds "$sid" turn)" != 1 ]; then
+    fail hooks_json_structure "UserPromptSubmit should start the turn's hold"
+    return
+  fi
+  run_hooks_json SubagentStart "{\"session_id\":\"$sid\",\"agent_id\":\"a1\"}" "$claude"
+  if [ "$(count_holds "$sid" subagent-a1)" != 1 ]; then
+    fail hooks_json_structure "SubagentStart should start the subagent's hold"
+    return
+  fi
+  run_hooks_json SubagentStop "{\"session_id\":\"$sid\",\"agent_id\":\"a1\"}" "$claude"
+  if ! wait_gone "$sid" subagent-a1 3; then
+    fail hooks_json_structure "SubagentStop should end the subagent's hold"
+    return
+  fi
+  for event in Stop StopFailure; do
+    run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+    run_hooks_json "$event" "{\"session_id\":\"$sid\"}" "$claude"
+    if ! wait_gone "$sid" turn 3; then
+      fail hooks_json_structure "$event should end the turn's hold"
+      return
+    fi
+  done
+  # This test shell plays claude, as in hook_background_shell.
+  tasks="${BASE}/claude-tmp/${sid}/tasks"
+  mkdir -p "$tasks"
+  (exec /bin/sleep 600) </dev/null >"${tasks}/${task}.output" 2>/dev/null &
+  shell=$!
+  FAKES+=("$shell")
+  run_hooks_json PostToolUse "{\"session_id\":\"$sid\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\",\"run_in_background\":true},\"tool_response\":{\"backgroundTaskId\":\"$task\"}}" "$$"
+  if [ "$(count_holds "$sid" "shell-$task")" != 1 ]; then
+    kill "$shell"
+    fail hooks_json_structure "PostToolUse on a background Bash should start the shell's hold"
+    return
+  fi
+  run_hooks_json UserPromptSubmit "{\"session_id\":\"$sid\"}" "$claude"
+  run_hooks_json SessionEnd "{\"session_id\":\"$sid\",\"reason\":\"exit\"}" "$claude"
+  if ! wait_gone "$sid" "" 3; then
+    kill "$shell"
+    fail hooks_json_structure "SessionEnd should end every hold"
+    return
+  fi
+  kill "$shell"
   pass hooks_json_structure
 }
 
@@ -1299,16 +1351,33 @@ test_battery_capacities_move() {
   pass battery_capacities_move
 }
 
+# The lid guard runs through sudo -n only commands the printed rule allows.
 test_sudoers_rule() {
-  local out
+  needs_exec sudoers_rule || return
+  local out allowed sid="${RUN}-sudoers" call calls
   out=$("${CLAFF[@]}" sudoers)
-  # Each command the script runs has to be spelled as the rule allows it.
-  # shellcheck disable=SC2016 # the script's own text, $1 unexpanded
-  if [[ $out != *"$(id -un) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"* ]] ||
-    ! grep -q 'sudo -n /usr/bin/pmset -a disablesleep "$1"' "${ROOT_DIR}/bin/claffeinate"; then
-    fail sudoers_rule "the rule and the command differ: $out"
+  if [[ $out != *"$(id -un) ALL=(root) NOPASSWD: "* ]]; then
+    fail sudoers_rule "the rule should let $(id -un) run its commands without a password: $out"
     return
   fi
+  allowed=", ${out##*NOPASSWD: }, "
+  lid_reset
+  lid_claude
+  lid_on start --holder turn --session "$sid" --claude-pid "$LID_CLAUDE" >/dev/null
+  stubbed stop --holder turn --session "$sid"
+  wait_gone "$sid" "" 5
+  lid_wait_call 'disablesleep 0'
+  calls=$(lid_calls)
+  if [ "$(printf '%s\n' "$calls" | grep -c .)" -lt 2 ]; then
+    fail sudoers_rule "a lid hold should set and clear disablesleep through sudo: $calls"
+    return
+  fi
+  while IFS= read -r call; do
+    if [[ $call != "sudo -n "* ]] || [[ $allowed != *", ${call#sudo -n }, "* ]]; then
+      fail sudoers_rule "'$call' isn't sudo -n with a command the rule allows: $out"
+      return
+    fi
+  done <<<"$calls"
   pass sudoers_rule
 }
 
