@@ -1093,7 +1093,6 @@ run_hooks_json() {
 # Each hooks.json entry, run as written, starts or ends the hold its event
 # stands for.
 test_hooks_json_structure() {
-  needs_exec hooks_json_structure || return
   local hooks_json="${ROOT_DIR}/hooks/hooks.json"
   local known="UserPromptSubmit SubagentStart SubagentStop PostToolUse Stop StopFailure SessionEnd"
   local events event timeout
@@ -1114,6 +1113,8 @@ test_hooks_json_structure() {
     return
   fi
 
+  # Only running the commands needs processes; the checks above don't.
+  needs_exec hooks_json_structure || return
   local sid="${RUN}-hooksjson" task="bhj7k2" claude tasks shell
   claude=$(fake_process)
   FAKES+=("$claude")
