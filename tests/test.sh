@@ -58,6 +58,10 @@ EOF
 chmod +x "${BASE}/sudo-stub/sudo"
 PATH="${BASE}/sudo-stub:$PATH"
 REAL_PATH="$PATH"
+# The ps on PATH before any stub: the Nix check supplies a non-setuid one,
+# since the build denies exec of the setuid /bin/ps.
+REAL_PS=$(command -v ps)
+export REAL_PS
 export RUN="t$$"
 
 FAILS=0
@@ -87,10 +91,16 @@ skip() {
   SKIPS=$((SKIPS + 1))
 }
 
-# Skips test $1 when processes can't be started.
+# Skips test $1 when processes can't be started, or fails it under
+# CLAFFEINATE_TESTS_REQUIRE_EXEC=1, as the Nix check sets, so that check
+# can't pass by skipping.
 needs_exec() {
   [ "$SYSTEM_EXEC_BLOCKED" = 0 ] && return 0
-  skip "$1" "needs caffeinate(1), /bin/sleep and ps(1) (build sandbox blocks them)"
+  if [ "${CLAFFEINATE_TESTS_REQUIRE_EXEC:-0}" = 1 ]; then
+    fail "$1" "needs caffeinate(1), /bin/sleep and ps(1), which can't run here"
+  else
+    skip "$1" "needs caffeinate(1), /bin/sleep and ps(1) (build sandbox blocks them)"
+  fi
   return 1
 }
 
@@ -190,7 +200,7 @@ printf '#!/usr/bin/env bash\necho 15.6.1\n' >"${STUBS}/sw_vers"
 # disablesleep set under a test.
 cat >"${STUBS}/ps" <<'EOF'
 #!/usr/bin/env bash
-/bin/ps "$@" | grep -- "session-${RUN}"
+"$REAL_PS" "$@" | grep -- "session-${RUN}"
 exit 0
 EOF
 chmod +x "${STUBS}"/*
