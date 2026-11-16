@@ -335,8 +335,10 @@ only the run's processes. A stand-in `sudo` is first on `PATH` for every test
 and holds default to `awake-lid-closed` off, so no test reaches the real
 `pmset disablesleep`; the `ioreg` stub is too, so no hold reads the real
 battery. Tests that start
-processes skip where `/bin/sleep` or `ps` can't run, as in a sandboxed Nix
-build.
+processes skip where `/bin/sleep` or `ps` can't run, or fail there under
+`CLAFFEINATE_TESTS_REQUIRE_EXEC=1`, which the Nix `tests` check sets so it
+can't pass by skipping; that check puts nixpkgs' non-setuid `ps` first on
+`PATH`, since the build denies exec of `/bin/ps`.
 
 | Test                          | Checks                                                                                  |
 | ----------------------------- | --------------------------------------------------------------------------------------- |
@@ -365,7 +367,7 @@ build.
 | `hook_events`                 | prompt, subagent start and stop, stop, session-end; a Monitor or foreground Bash gets no hold; silent |
 | `hook_background_shell`       | a background Bash gets a hold waiting on the shell writing `tasks/<id>.output`, ending with it |
 | `hook_noop_without_caffeinate`| silent no-op without `caffeinate`, or off Darwin                                        |
-| `hooks_json_structure`        | every event known and present, every action handled, timeouts ≥ 15 s, `PostToolUse` matches `Bash` |
+| `hooks_json_structure`        | exactly the known events, timeouts ≥ 15 s, `PostToolUse` matches `Bash`; each event's command, run as written, starts or ends its hold |
 | `non_macos_error`             | off macOS, `start` exits 1 with the macOS error and `start --help` works                |
 | `lid_guard_spans_holds`       | two holds set the flag once; it stays for the one left, and the last clears it          |
 | `lid_guard_holds_end_together`| four holds killed together clear the flag                                               |
@@ -375,7 +377,7 @@ build.
 | `lid_without_the_rule`        | a refused `sudo` keeps the hold, warns, shows `guard=denied`; a later hold recovers     |
 | `lid_stale_flag_cleared`      | `guard=stale`; `kill-orphans` clears it, `--dry-run` only says so                       |
 | `battery_capacities_move`     | capacities inside `BatteryData` or missing: the percent shows, and the floor ends a hold |
-| `sudoers_rule`                | the rule printed matches the command the script runs                                    |
+| `sudoers_rule`                | each `sudo` call a lid hold makes is `sudo -n` with a command the printed rule allows   |
 
 ## Out of scope
 
