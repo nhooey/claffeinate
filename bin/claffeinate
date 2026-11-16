@@ -1926,6 +1926,7 @@ cmd_status() {
   done
   [[ $stops =~ ^[0-9]+$ ]] || die "--stops: not a number: $stops" 2
   [ "$json" = 0 ] || require_jq
+  check_config "${CLAUDE_CODE_SESSION_ID:-}"
   resolve_limits "" "" "" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null
   collect_holds
   forecast
@@ -2139,7 +2140,6 @@ main() {
   stop) cmd_stop "$@" ;;
   list) cmd_list "$@" ;;
   status)
-    check_config "${CLAUDE_CODE_SESSION_ID:-}"
     resolve_emoji
     # Column widths count characters, so measure them in UTF-8 whatever
     # the locale; the locale only decides whether emoji show.
