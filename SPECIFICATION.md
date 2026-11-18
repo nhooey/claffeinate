@@ -1,35 +1,31 @@
 # `claffeinate` — implementation spec
 
-A Bash script that keeps a Mac awake only while Claude Code is working, one
-**hold** per thing that works: a turn, a subagent or a background shell.
-Every hold also ends on its own: when its `claude` process exits, at a
-duration cap and at a battery floor. `status` shows every hold on the Mac
-and when the Mac will be allowed to sleep.
+A Bash script that keeps a Mac awake only while Claude Code is working, one **hold** per thing that works: a turn, a subagent or a background shell.
+Every hold also ends on its own: when its `claude` process exits, at a duration cap and at a battery floor.
+`status` shows every hold on the Mac and when the Mac will be allowed to sleep.
 
-Single-file Bash script. macOS-only. Small functions, a dispatch table, and
-the process table as the only registry of holds.
+Single-file Bash script.
+macOS-only.
+Small functions, a dispatch table, and the process table as the only registry of holds.
 
 ## Terms
 
-- **Session:** a Claude Code conversation, by its `session_id`
-  (`$CLAUDE_CODE_SESSION_ID`). Outside Claude Code it is `none`.
-- **Holder:** what a hold is for, within a session: `turn`,
-  `subagent-<agent_id>`, `shell-<backgroundTaskId>`, or `manual`.
-- **Hold:** a watcher process and its `caffeinate` child. A holder has at
-  most one.
+- **Session:** a Claude Code conversation, by its `session_id` (`$CLAUDE_CODE_SESSION_ID`).
+  Outside Claude Code it is `none`.
+- **Holder:** what a hold is for, within a session: `turn`, `subagent-<agent_id>`, `shell-<backgroundTaskId>`, or `manual`.
+- **Hold:** a watcher process and its `caffeinate` child.
+  A holder has at most one.
 
 ## Constraints
 
-- macOS Darwin only: `caffeinate`, `pmset`, `ioreg`, `sw_vers`, `ps`,
-  `pgrep`, `lsof`.
-- Bash 3.2+: no Bash 4 features. `${arr[@]}` on a possibly empty array is
-  written `${arr[@]+"${arr[@]}"}`.
-- `jq` is required for `--json`, which exits 4 without it, and for the hook
-  to read its payload; without `jq` the hook keeps only the turn's hold.
-- `set -euo pipefail` in the script. Never `| head` on a function's output
-  under `pipefail`: the writer's SIGPIPE fails the pipeline.
-- Processes are listed with `ps -A -ww -o pid=,ppid=,command=`, once per
-  command (`load_procs`). Without `-ww`, `ps` truncates long command lines.
+- macOS Darwin only: `caffeinate`, `pmset`, `ioreg`, `sw_vers`, `ps`, `pgrep`, `lsof`.
+- Bash 3.2+: no Bash 4 features.
+  `${arr[@]}` on a possibly empty array is written `${arr[@]+"${arr[@]}"}`.
+- `jq` is required for `--json`, which exits 4 without it, and for the hook to read its payload; without `jq` the hook keeps only the turn's hold.
+- `set -euo pipefail` in the script.
+  Never `| head` on a function's output under `pipefail`: the writer's SIGPIPE fails the pipeline.
+- Processes are listed with `ps -A -ww -o pid=,ppid=,command=`, once per command (`load_procs`).
+  Without `-ww`, `ps` truncates long command lines.
 
 ## The hold
 
@@ -45,65 +41,50 @@ session-<sid>--holder-<holder>--claude-<pid>--max-<seconds>--floor-<percent>--li
 ```
 
 - `<sid>` and `<holder>` match `^[A-Za-z0-9_.-]+$` and never contain `--`.
-- `claude-0` means no claude process to watch; `floor-0` means no battery
-  floor; `lid-1` means the hold takes part in the lid guard. A tag without
-  `--lid-` is 0.3.0's, and means `lid-0`.
-- The settings in force at `start` are in the tag, so a later change never
-  moves a running hold.
-- A watcher is a process whose `argv[0]` starts with `claffeinate-watch--`
-  **and whose parent isn't one**: a watcher's own forks (its timer, the
-  subshell before `exec caffeinate`) carry its argv until they exec.
-- The target of `-w` is `--wait-pid` if given, else the claude PID, else
-  none.
-- The pattern `^(/[^ ]*/)?caffeinate--claffeinate--` also matches a
-  symlink directory before the name, as in 0.2.0's tags.
+- `claude-0` means no claude process to watch; `floor-0` means no battery floor; `lid-1` means the hold takes part in the lid guard.
+  A tag without `--lid-` is 0.3.0's, and means `lid-0`.
+- The settings in force at `start` are in the tag, so a later change never moves a running hold.
+- A watcher is a process whose `argv[0]` starts with `claffeinate-watch--` **and whose parent isn't one**: a watcher's own forks (its timer, the subshell before `exec caffeinate`) carry its argv until they exec.
+- The target of `-w` is `--wait-pid` if given, else the claude PID, else none.
+- The pattern `^(/[^ ]*/)?caffeinate--claffeinate--` also matches a symlink directory before the name, as in 0.2.0's tags.
 
 ### The watcher (`cmd_watch`)
 
-1. Start `caffeinate` as a background child, and trap `USR1` as `ended`,
-   `TERM` and `INT` as `killed`, `USR2` as a wake-up; ignore `HUP`.
+1. Start `caffeinate` as a background child, and trap `USR1` as `ended`, `TERM` and `INT` as `killed`, `USR2` as a wake-up; ignore `HUP`.
 2. Loop:
-   - the `caffeinate` is gone: `claude-exited` if the claude PID is gone
-     too, else `ended`
+   - the `caffeinate` is gone: `claude-exited` if the claude PID is gone too, else `ended`
    - the claude PID is gone: `claude-exited`
    - `now >= at + max`: `cap`
-   - the floor is above 0, a battery is present, and `CurrentCapacity <=
-     floor`: `battery`, on AC power too
-   - otherwise start a timer `(sleep N && kill -USR2 $$) &`, with N the
-     lesser of the interval (`$CLAFFEINATE_WATCH_INTERVAL`, default 60) and
-     the time left to the cap, and `wait` on the `caffeinate`: it returns
-     when the `caffeinate` exits or a trapped signal arrives
-3. Kill the `caffeinate`, write the stop log line. With `lid-1`, wait for
-   the `caffeinate` to exit, then run `lid_sync`. Exit 0.
+   - the floor is above 0, a battery is present, and `CurrentCapacity <= floor`: `battery`, on AC power too
+   - otherwise start a timer `(sleep N && kill -USR2 $$) &`, with N the lesser of the interval (`$CLAFFEINATE_WATCH_INTERVAL`, default 60) and the time left to the cap, and `wait` on the `caffeinate`: it returns when the `caffeinate` exits or a trapped signal arrives
+3. Kill the `caffeinate`, write the stop log line.
+   With `lid-1`, wait for the `caffeinate` to exit, then run `lid_sync`.
+   Exit 0.
 
-A paused hold keeps its watcher and has no `caffeinate`. On each pass the watcher reads the rules: if one covers it, it ends its `caffeinate` and runs `lid_sync`; if none does, it starts one, and after a pause waits for it and runs `lid_sync`. Paused, it checks the `--wait-pid` target itself, naps no longer than the rule's end, and keeps every other limit. `start` during a pause starts a paused hold. `kill-orphans` leaves paused holds alone.
+A paused hold keeps its watcher and has no `caffeinate`.
+On each pass the watcher reads the rules: if one covers it, it ends its `caffeinate` and runs `lid_sync`; if none does, it starts one, and after a pause waits for it and runs `lid_sync`.
+Paused, it checks the `--wait-pid` target itself, naps no longer than the rule's end, and keeps every other limit.
+`start` during a pause starts a paused hold.
+`kill-orphans` leaves paused holds alone.
 
 ### The lid guard (`lid_sync`)
 
-A `PreventUserIdleSystemSleep` assertion doesn't stop lid-close sleep; only
-`pmset -a disablesleep 1` does, which is machine-wide, needs root, and has no
-owner. `lid_sync`, under the lock `$RUN_DIR/locks/lid-guard`:
+A `PreventUserIdleSystemSleep` assertion doesn't stop lid-close sleep; only `pmset -a disablesleep 1` does, which is machine-wide, needs root, and has no owner.
+`lid_sync`, under the lock `$RUN_DIR/locks/lid-guard`:
 
-- Counts the running tagged `caffeinate`s with `lid-1`. It counts these, not
-  watchers, because a watcher waits for its `caffeinate` before it syncs, so
-  of two holds ending together the later sync sees neither.
-- With any, and `SleepDisabled` 0 in `pmset -g`: runs
-  `sudo -n /usr/bin/pmset -a disablesleep 1`. On success it creates
-  `$STATE_DIR/lid-guard-owned` and removes `lid-guard-denied`; on failure it
-  creates `lid-guard-denied`. A flag already set is left as it is, unowned.
-- With none, and `lid-guard-owned` present: runs
-  `sudo -n /usr/bin/pmset -a disablesleep 0`, removes both markers, and runs
-  `pmset sleepnow` if `AppleClamshellState` and `AppleClamshellCausesSleep`
-  are both `Yes` in `ioreg -r -k AppleClamshellState -d 4`. macOS asks for lid
-  sleep when the lid closes, so nothing else would sleep it.
-- With none, and no marker: does nothing, so it never clears a flag it
-  didn't set.
+- Counts the running tagged `caffeinate`s with `lid-1`.
+  It counts these, not watchers, because a watcher waits for its `caffeinate` before it syncs, so of two holds ending together the later sync sees neither.
+- With any, and `SleepDisabled` 0 in `pmset -g`: runs `sudo -n /usr/bin/pmset -a disablesleep 1`.
+  On success it creates `$STATE_DIR/lid-guard-owned` and removes `lid-guard-denied`; on failure it creates `lid-guard-denied`.
+  A flag already set is left as it is, unowned.
+- With none, and `lid-guard-owned` present: runs `sudo -n /usr/bin/pmset -a disablesleep 0`, removes both markers, and runs `pmset sleepnow` if `AppleClamshellState` and `AppleClamshellCausesSleep` are both `Yes` in `ioreg -r -k AppleClamshellState -d 4`.
+  macOS asks for lid sleep when the lid closes, so nothing else would sleep it.
+- With none, and no marker: does nothing, so it never clears a flag it didn't set.
 
-`start` syncs after its hold is up, when the hold has `lid-1` or the marker
-exists, and warns on stderr if `lid-guard-denied` exists. `kill-orphans`
-syncs when the marker exists. Every change to the holds syncs after it, so
-the last sync sees the final holds. The marker is in `$STATE_DIR`, since
-`SleepDisabled` can outlive a reboot.
+`start` syncs after its hold is up, when the hold has `lid-1` or the marker exists, and warns on stderr if `lid-guard-denied` exists.
+`kill-orphans` syncs when the marker exists.
+Every change to the holds syncs after it, so the last sync sees the final holds.
+The marker is in `$STATE_DIR`, since `SleepDisabled` can outlive a reboot.
 
 ## CLI surface
 
@@ -125,8 +106,8 @@ claffeinate sudoers
 claffeinate help [COMMAND]
 ```
 
-`--no-emoji` and `--emoji` are accepted anywhere. `COMMAND --help` and
-`help COMMAND` print the same text, starting `Usage: claffeinate COMMAND`.
+`--no-emoji` and `--emoji` are accepted anywhere.
+`COMMAND --help` and `help COMMAND` print the same text, starting `Usage: claffeinate COMMAND`.
 An unknown flag exits 2 naming `claffeinate COMMAND --help`.
 
 | Command        | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -141,31 +122,24 @@ An unknown flag exits 2 naming `claffeinate COMMAND --help`.
 | `status`       | Below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `config`       | Each setting's value and layer, then the session file, config file, defaults file and log paths; `--defaults` prints the defaults file. `set` validates the value; `set`/`unset` on a session also record `claude-pid = $CLAUDE_PID`.                                                                                                                                                                                                                                                                                                                                    |
 
-Durations: a bare number of seconds, or `<n>d<n>h<n>m<n>s` parts in that
-order, total above 0. Battery: an integer 0–100.
+Durations: a bare number of seconds, or `<n>d<n>h<n>m<n>s` parts in that order, total above 0.
+Battery: an integer 0–100.
 
 ## Settings
 
-`awake-max-duration`, `awake-min-battery`, `awake-lid-closed` and `emoji`,
-each with its default and a comment in `share/claffeinate/defaults.conf`.
-The script finds that file as `../share/claffeinate/defaults.conf` from its
-own path with symlinks resolved, and holds no default of its own. Layers,
-strongest first, in `resolve_setting`:
+`awake-max-duration`, `awake-min-battery`, `awake-lid-closed` and `emoji`, each with its default and a comment in `share/claffeinate/defaults.conf`.
+The script finds that file as `../share/claffeinate/defaults.conf` from its own path with symlinks resolved, and holds no default of its own.
+Layers, strongest first, in `resolve_setting`:
 
 1. the flag
 2. `$CLAFFEINATE_STATE_DIR/sessions/<sid>.conf`
-3. `CLAFFEINATE_AWAKE_MAX_DURATION`, `CLAFFEINATE_AWAKE_MIN_BATTERY`,
-   `CLAFFEINATE_AWAKE_LID_CLOSED`, `CLAFFEINATE_EMOJI` (Claude Code fills these from `--settings`, project
-   and user `settings.json` `env`, then the launch environment)
+3. `CLAFFEINATE_AWAKE_MAX_DURATION`, `CLAFFEINATE_AWAKE_MIN_BATTERY`, `CLAFFEINATE_AWAKE_LID_CLOSED`, `CLAFFEINATE_EMOJI` (Claude Code fills these from `--settings`, project and user `settings.json` `env`, then the launch environment)
 4. `$CLAFFEINATE_CONFIG`, default `$XDG_CONFIG_HOME/claffeinate/config`
 5. the defaults file
 
-Files hold `setting = value` lines, `#` comments, last one wins, parsed
-with `awk` and never sourced. A bad value in layers 2–4 warns on stderr and
-falls through; a bad flag exits 2. `start`, `status` and `config` exit 2 on
-a line in the defaults, config or session file that names no setting (a
-session file may also hold `claude-pid`), or when the defaults file is
-missing; the commands that end holds never read the files.
+Files hold `setting = value` lines, `#` comments, last one wins, parsed with `awk` and never sourced.
+A bad value in layers 2–4 warns on stderr and falls through; a bad flag exits 2.
+`start`, `status` and `config` exit 2 on a line in the defaults, config or session file that names no setting (a session file may also hold `claude-pid`), or when the defaults file is missing; the commands that end holds never read the files.
 
 ## Paths
 
@@ -179,9 +153,7 @@ missing; the commands that end holds never read the files.
 | `CLAFFEINATE_WATCH_INTERVAL` | `60`                                               |
 | `CLAFFEINATE_NOW`            | the current time, for `status` (tests)             |
 
-The log is in `~/Library/Logs` because Console.app lists files there but
-doesn't follow a symlink placed there; `$STATE_DIR/claffeinate.log` links to
-it, created on the first write.
+The log is in `~/Library/Logs` because Console.app lists files there but doesn't follow a symlink placed there; `$STATE_DIR/claffeinate.log` links to it, created on the first write.
 
 ## The stop log
 
@@ -191,53 +163,35 @@ One line per stopped hold, appended with a single `printf >>`:
 <ISO 8601 time> session=<sid> holder=<holder> reason=<reason> ran=<duration> start=<epoch> stop=<epoch>
 ```
 
-Reasons: `ended`, `claude-exited`, `cap`, `battery`, `killed`. When the
-file passes 2,000 lines it is cut to its last 1,000.
+Reasons: `ended`, `claude-exited`, `cap`, `battery`, `killed`.
+When the file passes 2,000 lines it is cut to its last 1,000.
 
 ## `status`
 
 ### Inputs
 
-- `read_battery`, from `ioreg -rn AppleSmartBattery`: `CurrentCapacity`
-  (%), `AppleRawCurrentCapacity` and `AppleRawMaxCapacity` (mAh), `Amperage`
-  (mA; printed unsigned, wrapped back to negative by Bash arithmetic),
-  `ExternalConnected`, `BatteryInstalled`. No `CurrentCapacity`: a desktop.
-  macOS 27 has the two raw capacities only inside `BatteryData`. If neither
-  place has them, the floor still works, on `CurrentCapacity`, and the
-  forecast has no time.
+- `read_battery`, from `ioreg -rn AppleSmartBattery`: `CurrentCapacity` (%), `AppleRawCurrentCapacity` and `AppleRawMaxCapacity` (mAh), `Amperage` (mA; printed unsigned, wrapped back to negative by Bash arithmetic), `ExternalConnected`, `BatteryInstalled`.
+  No `CurrentCapacity`: a desktop.
+  macOS 27 has the two raw capacities only inside `BatteryData`.
+  If neither place has them, the floor still works, on `CurrentCapacity`, and the forecast has no time.
 - `macos_sleep_model`, the only OS-specific part:
   - the power source from `pmset -g batt`
-  - that source's `displaysleep` and `sleep` from `pmset -g custom` (0 is
-    never)
+  - that source's `displaysleep` and `sleep` from `pmset -g custom` (0 is never)
   - the last input, `now − HIDIdleTime / 10⁹`, from `ioreg -c IOHIDSystem`
-  - `other`: `NAME:PID` of every process in `pmset -g assertions`' "Listed
-    by owning process" with `PreventUserIdleSystemSleep`,
-    `PreventSystemSleep`, `PreventUserIdleDisplaySleep`,
-    `NoIdleSleepAssertion` or `NoDisplaySleepAssertion`, except `powerd`
-    (its display-on assertion is modeled) and the holds' own `caffeinate`s
+  - `other`: `NAME:PID` of every process in `pmset -g assertions`' "Listed by owning process" with `PreventUserIdleSystemSleep`, `PreventSystemSleep`, `PreventUserIdleDisplaySleep`, `NoIdleSleepAssertion` or `NoDisplaySleepAssertion`, except `powerd` (its display-on assertion is modeled) and the holds' own `caffeinate`s
 
 ### The forecast
 
-- `battery_end(floor)`: now if `CurrentCapacity <= floor`; nothing if not
-  draining (`Amperage >= 0`); else `now + (cur·100 − floor·max)·36 ÷ −amp`
-  seconds.
-- Each hold ends at the earlier of `at + max` (`time`) and
-  `battery_end(its floor)` (`battery`).
-- `time`: the latest `at + max`; `cap=` that hold's max, or the setting with
-  no holds.
-- `battery`: `battery_end` of the lowest floor; `-` with no holds or no
-  drain; details `now=P% floor=F% rate=-R%/h`, `rate=0` with no drain,
-  `floor=off` at 0, `none` without a battery.
-- `macos_sleep_at(T)`: the latest of `T`, `input + displaysleep` and
-  `input + sleep`; nothing while `other` is set or either setting is never.
+- `battery_end(floor)`: now if `CurrentCapacity <= floor`; nothing if not draining (`Amperage >= 0`); else `now + (cur·100 − floor·max)·36 ÷ −amp` seconds.
+- Each hold ends at the earlier of `at + max` (`time`) and `battery_end(its floor)` (`battery`).
+- `time`: the latest `at + max`; `cap=` that hold's max, or the setting with no holds.
+- `battery`: `battery_end` of the lowest floor; `-` with no holds or no drain; details `now=P% floor=F% rate=-R%/h`, `rate=0` with no drain, `floor=off` at 0, `none` without a battery.
+- `macos_sleep_at(T)`: the latest of `T`, `input + displaysleep` and `input + sleep`; nothing while `other` is set or either setting is never.
 - `macos`: `macos_sleep_at(now)`.
-- `sleep`: with holds, `macos_sleep_at(last hold's end)`, `by=` that hold's
-  limit unless macOS comes later or never (`by=macos`); with none, `macos`.
-- `lid`: the latest end among the `lid-1` holds, `-` with none; details
-  `state=<open|closed|none> setting=<on|off> guard=<g>`. `guard` is `on`
-  (`SleepDisabled` 1, marker, lid holds), `stale` (1, marker, no lid holds),
-  `user` (1, no marker), `denied` (0, `lid-guard-denied`, setting on) or
-  `off`. With `user` or `stale`, `macos_sleep_at` is nothing.
+- `sleep`: with holds, `macos_sleep_at(last hold's end)`, `by=` that hold's limit unless macOS comes later or never (`by=macos`); with none, `macos`.
+- `lid`: the latest end among the `lid-1` holds, `-` with none; details `state=<open|closed|none> setting=<on|off> guard=<g>`.
+  `guard` is `on` (`SleepDisabled` 1, marker, lid holds), `stale` (1, marker, no lid holds), `user` (1, no marker), `denied` (0, `lid-guard-denied`, setting on) or `off`.
+  With `user` or `stale`, `macos_sleep_at` is nothing.
 
 ### Output
 
@@ -258,55 +212,38 @@ STOPPED <clock> <rel>  SESSION  NAME  HOLDER  REASON  RAN
 (none)
 ```
 
-- A moment is a clock time, `HH:MM`, or `MM-DD HH:MM` when not today,
-  beside its distance from now, always signed: `+3h12m`, `-40s`, `+0s`. A
-  duration is never signed: `40s`, `5m`, `1h02m`, `4h`, `2d03h`. Unknown or
-  not applicable: `-`.
-- Columns are padded to the widest cell, with a minimum width per column,
-  so the shape doesn't change between readings; `(none)` takes no part in
-  the widths.
-- `SESSION` is the first 8 characters of the session id. `NAME` is the last
-  `custom-title` record of `$CLAUDE_CONFIG_DIR/projects/*/<sid>.jsonl`,
-  else its last `ai-title`, else `-`, cut to 22 characters with `…`.
+- A moment is a clock time, `HH:MM`, or `MM-DD HH:MM` when not today, beside its distance from now, always signed: `+3h12m`, `-40s`, `+0s`.
+  A duration is never signed: `40s`, `5m`, `1h02m`, `4h`, `2d03h`.
+  Unknown or not applicable: `-`.
+- Columns are padded to the widest cell, with a minimum width per column, so the shape doesn't change between readings; `(none)` takes no part in the widths.
+- `SESSION` is the first 8 characters of the session id.
+  `NAME` is the last `custom-title` record of `$CLAUDE_CONFIG_DIR/projects/*/<sid>.jsonl`, else its last `ai-title`, else `-`, cut to 22 characters with `…`.
 - Stops are the log's last N lines (`--stops`, default 5), newest first.
 - `--explain` appends how macOS decides to sleep, with the live values.
-- `--json`: `now`, `power`, `sleep`, `time`, `battery`, `macos`, `lid`,
-  `holds`, `stops`, every moment as `{at, in}` or `null`.
+- `--json`: `now`, `power`, `sleep`, `time`, `battery`, `macos`, `lid`, `holds`, `stops`, every moment as `{at, in}` or `null`.
 - `status` never runs `sudo`.
 
 ### Emoji
 
-`emoji_for` holds every emoji: 💤 ⏳ 🔋 💻 📕 for the forecast lines; 🟢 🔴 for
-`alive` and `dead`; 💬 🤖 🐚 ✋ for `turn`, `subagent`, `shell`, `manual`; ✅ ⏳
-🔋 🚪 🧹 for `ended`, `cap`, `battery`, `claude-exited`, `killed`. Each is
-one code point with `East_Asian_Width=W` and `Emoji_Presentation=Yes`: no
-variation selector, so every terminal draws it 2 columns wide. Text-default
-symbols such as ⚠, ⏱ and 🖥 are excluded.
+`emoji_for` holds every emoji: 💤 ⏳ 🔋 💻 📕 for the forecast lines; 🟢 🔴 for `alive` and `dead`; 💬 🤖 🐚 ✋ for `turn`, `subagent`, `shell`, `manual`; ✅ ⏳ 🔋 🚪 🧹 for `ended`, `cap`, `battery`, `claude-exited`, `killed`.
+Each is one code point with `East_Asian_Width=W` and `Emoji_Presentation=Yes`: no variation selector, so every terminal draws it 2 columns wide.
+Text-default symbols such as ⚠, ⏱ and 🖥 are excluded.
 
-An emoji always precedes its word. A marked cell is drawn 3 columns wider
-than its word whether emoji are on or off, so turning them off moves no
-column. They are off with `--no-emoji`, the `emoji = off` setting, or a
-locale (`LC_ALL`, `LC_CTYPE`, `LANG`) that isn't UTF-8. Widths are measured
-with `LC_ALL=en_US.UTF-8` either way.
+An emoji always precedes its word.
+A marked cell is drawn 3 columns wider than its word whether emoji are on or off, so turning them off moves no column.
+They are off with `--no-emoji`, the `emoji = off` setting, or a locale (`LC_ALL`, `LC_CTYPE`, `LANG`) that isn't UTF-8.
+Widths are measured with `LC_ALL=en_US.UTF-8` either way.
 
 ## Claude Code plugin
 
-- `.claude-plugin/plugin.json`: the manifest; `version` is the single
-  version, read by the Nix package too.
-- `.claude-plugin/marketplace.json`: a marketplace named `claffeinate` with
-  one plugin whose `source` is `./`.
-- `hooks/hooks.json`: one command hook per event, each
-  `bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" ACTION`, 15-second
-  timeout; `PostToolUse` matches `Bash` only.
-- `hooks/claffeinate-hook.sh ACTION`: reads the JSON payload on stdin, and
-  runs `bin/claffeinate` beside it with stdin, stdout and stderr detached.
-  It never fails or prints, and does nothing unless `uname -s` is `Darwin`
-  and `caffeinate` is on `PATH`. The session comes from the payload's
-  `session_id`, else `$CLAUDE_CODE_SESSION_ID`; the claude PID from
-  `$CLAUDE_PID`.
+- `.claude-plugin/plugin.json`: the manifest; `version` is the single version, read by the Nix package too.
+- `.claude-plugin/marketplace.json`: a marketplace named `claffeinate` with one plugin whose `source` is `./`.
+- `hooks/hooks.json`: one command hook per event, each `bash "${CLAUDE_PLUGIN_ROOT}/hooks/claffeinate-hook.sh" ACTION`, 15-second timeout; `PostToolUse` matches `Bash` only.
+- `hooks/claffeinate-hook.sh ACTION`: reads the JSON payload on stdin, and runs `bin/claffeinate` beside it with stdin, stdout and stderr detached.
+  It never fails or prints, and does nothing unless `uname -s` is `Darwin` and `caffeinate` is on `PATH`.
+  The session comes from the payload's `session_id`, else `$CLAUDE_CODE_SESSION_ID`; the claude PID from `$CLAUDE_PID`.
 - `skills/status/SKILL.md`: `/claffeinate:status`, user-invoked.
-- `skills/set/SKILL.md`: `/claffeinate:set SETTING VALUE`, user-invoked;
-  runs `claffeinate config set --session "$CLAUDE_CODE_SESSION_ID"`.
+- `skills/set/SKILL.md`: `/claffeinate:set SETTING VALUE`, user-invoked; runs `claffeinate config set --session "$CLAUDE_CODE_SESSION_ID"`.
 - `bin/` is on the agent's Bash `PATH` while the plugin is enabled.
 
 | Hook event             | ACTION           | Action                                                                                                                |
@@ -318,25 +255,17 @@ with `LC_ALL=en_US.UTF-8` either way.
 | `PostToolUse` (`Bash`) | `post-tool`      | if `tool_input.run_in_background` is true: `start --holder shell-<tool_response.backgroundTaskId> --wait-pid <shell>` |
 | `SessionEnd`           | `session-end`    | `kill-session`                                                                                                        |
 
-The shell's PID: the child of `$CLAUDE_PID` (`pgrep -P`) whose fd 1, by
-`lsof -a -p <children> -d 1 -Fpn`, ends in `/tasks/<task id>.output`,
-retried for up to a second. A Monitor's stdout is a pipe, so it never
-matches; the `Monitor` tool also has its own `tool_name`.
+The shell's PID: the child of `$CLAUDE_PID` (`pgrep -P`) whose fd 1, by `lsof -a -p <children> -d 1 -Fpn`, ends in `/tasks/<task id>.output`, retried for up to a second.
+A Monitor's stdout is a pipe, so it never matches; the `Monitor` tool also has its own `tool_name`.
 
 ## Acceptance tests
 
-`tests/test.sh [NAME...]` runs every test, or only those named. Each prints
-`PASS`, `FAIL: reason` or `SKIP: reason`; it exits non-zero on any FAIL.
-Every test runs in its own directories with its own session ids and
-stand-in claude processes (`/bin/sleep` renamed `fake-claude`), with a
-1-second watch interval. Stubs for `ioreg`, `pmset` and `sw_vers` pin the
-battery, idle time, power settings, assertions and lid, and a `ps` stub shows
-only the run's processes. A stand-in `sudo` is first on `PATH` for every test
-and holds default to `awake-lid-closed` off, so no test reaches the real
-`pmset disablesleep`; the `ioreg` stub is too, so no hold reads the real
-battery. Tests that start
-processes skip where `/bin/sleep` or `ps` can't run, as in a sandboxed Nix
-build.
+`tests/test.sh [NAME...]` runs every test, or only those named.
+Each prints `PASS`, `FAIL: reason` or `SKIP: reason`; it exits non-zero on any FAIL.
+Every test runs in its own directories with its own session ids and stand-in claude processes (`/bin/sleep` renamed `fake-claude`), with a 1-second watch interval.
+Stubs for `ioreg`, `pmset` and `sw_vers` pin the battery, idle time, power settings, assertions and lid, and a `ps` stub shows only the run's processes.
+A stand-in `sudo` is first on `PATH` for every test and holds default to `awake-lid-closed` off, so no test reaches the real `pmset disablesleep`; the `ioreg` stub is too, so no hold reads the real battery.
+Tests that start processes skip where `/bin/sleep` or `ps` can't run, as in a sandboxed Nix build.
 
 | Test                          | Checks                                                                                  |
 | ----------------------------- | --------------------------------------------------------------------------------------- |
@@ -381,7 +310,6 @@ build.
 
 - Replacing `caffeinate` with direct `IOPMAssertion*` calls.
 - A daemon: each hold's watcher lives only as long as its hold.
-- Anything cross-platform. Off macOS, every command but help exits 1 with
-  `error: claffeinate needs macOS caffeinate(1)`. A port replaces
-  `macos_sleep_model` and `read_battery` (Linux: `systemd-inhibit`,
-  logind's `IdleActionSec`, `/sys/class/power_supply`).
+- Anything cross-platform.
+  Off macOS, every command but help exits 1 with `error: claffeinate needs macOS caffeinate(1)`.
+  A port replaces `macos_sleep_model` and `read_battery` (Linux: `systemd-inhibit`, logind's `IdleActionSec`, `/sys/class/power_supply`).
