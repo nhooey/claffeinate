@@ -12,22 +12,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # Every input below this divider is a skill source. They follow `nixpkgs`
-    # but not `agent-skill-flake`, so each keeps its own compatible builder.
-    coding-agent-skills = {
-      url = "github:nhooey/coding-agent-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    git-skills = {
-      url = "github:nhooey/git-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    nix-skills = {
-      url = "github:nhooey/nix-skills";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    shell-skills = {
-      url = "github:nhooey/shell-skills";
+    # The one skill source: skillspkgs' combination for the Claude Code
+    # tools family. It follows `nixpkgs` but not `agent-skill-flake`, so
+    # its skill sources keep their own compatible builder.
+    skillspkgs-combinations = {
+      url = "github:nhooey/skillspkgs?dir=sources/combinations";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -43,25 +32,7 @@
       systems = import inputs.systems;
       name = "claffeinate-skills";
       sources = [
-        # Commits, branches and pull requests, and the github-policy-* skills.
-        { source = inputs.git-skills; }
-        # Writing this flake and its sub-flake.
-        {
-          source = inputs.nix-skills;
-          skills = [ "nix-flakes" ];
-        }
-        # Safe shell commands, for the script and for agents working here.
-        { source = inputs.shell-skills; }
-        # Headless runs in this checkout, a tidy scratchpad, and the
-        # cross-repository plan's graph.
-        {
-          source = inputs.coding-agent-skills;
-          skills = [
-            "coding-agent-headless-in-checkout"
-            "coding-agent-plans-as-graph"
-            "coding-agent-scratchpad-scripts"
-          ];
-        }
+        { source = inputs.skillspkgs-combinations.combinations.claude-code-tools; }
       ];
     };
 }

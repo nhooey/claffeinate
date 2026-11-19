@@ -629,6 +629,13 @@ emoji on default" ] || {
     fail "$name" "a symlinked script should find the defaults file: $out"
     return
   }
+  # So does the script reached through a symlink to its directory.
+  ln -s "${ROOT_DIR}/bin" "${BASE}/link-dir"
+  out=$(bash "${BASE}/link-dir/claffeinate" config --defaults 2>&1)
+  [ "$out" = "$(cat "$defaults")" ] || {
+    fail "$name" "a script in a symlinked directory should find the defaults file: $out"
+    return
+  }
   pass "$name"
 }
 
@@ -642,6 +649,13 @@ test_unknown_setting_refused() {
     [ "$rc" = 2 ] && [[ $out == *"unknown setting: awake-max-duraton"* ]] || {
       "${CLAFF[@]}" kill-session --session "$sid" >/dev/null 2>&1
       fail "$name" "$cmd should refuse a misspelt setting: rc=$rc $out"
+      return
+    }
+    # Its help still shows, to say how to fix the file.
+    out=$(CLAFFEINATE_CONFIG="$cfg" "${CLAFF[@]}" "${cmd%% *}" --help 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && [[ $out == "Usage: claffeinate ${cmd%% *}"* ]] || {
+      fail "$name" "${cmd%% *} --help should work despite a misspelt setting: rc=$rc $out"
       return
     }
   done
@@ -1086,7 +1100,6 @@ run_hooks_json() {
 # Each hooks.json entry, run as written, starts or ends the hold its event
 # stands for.
 test_hooks_json_structure() {
-  needs_exec hooks_json_structure || return
   local hooks_json="${ROOT_DIR}/hooks/hooks.json"
   local known="UserPromptSubmit SubagentStart SubagentStop PostToolUse Stop StopFailure SessionEnd"
   local events event timeout
@@ -1107,6 +1120,8 @@ test_hooks_json_structure() {
     return
   fi
 
+  # Only running the commands needs processes; the checks above don't.
+  needs_exec hooks_json_structure || return
   local sid="${RUN}-hooksjson" task="bhj7k2" claude tasks shell
   claude=$(fake_process)
   FAKES+=("$claude")

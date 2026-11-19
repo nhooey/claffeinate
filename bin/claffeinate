@@ -45,7 +45,8 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 readonly SELF
 # The shipped defaults file, installed beside the script as
 # ../share/claffeinate/defaults.conf. Found through the script's real path,
-# so a symlink to it in ~/bin still finds it.
+# so a symlink to it in ~/bin still finds it, and cd -P resolves a
+# symlinked directory on the way before ".." climbs out of it.
 real_self() {
   local p="$SELF" l
   while [ -L "$p" ]; do
@@ -57,7 +58,7 @@ real_self() {
   done
   printf '%s\n' "$p"
 }
-DEFAULTS_FILE="$(cd "$(dirname "$(real_self)")/.." && pwd)/share/claffeinate/defaults.conf"
+DEFAULTS_FILE="$(cd -P "$(dirname "$(real_self)")/.." && pwd)/share/claffeinate/defaults.conf"
 readonly DEFAULTS_FILE
 # Every path is overridable, for tests and sandboxed builds. RUN_DIR must
 # end with "/".
@@ -1925,6 +1926,7 @@ cmd_status() {
   done
   [[ $stops =~ ^[0-9]+$ ]] || die "--stops: not a number: $stops" 2
   [ "$json" = 0 ] || require_jq
+  check_config "${CLAUDE_CODE_SESSION_ID:-}"
   resolve_limits "" "" "" "${CLAUDE_CODE_SESSION_ID:-}" 2>/dev/null
   collect_holds
   forecast
@@ -2138,7 +2140,6 @@ main() {
   stop) cmd_stop "$@" ;;
   list) cmd_list "$@" ;;
   status)
-    check_config "${CLAUDE_CODE_SESSION_ID:-}"
     resolve_emoji
     # Column widths count characters, so measure them in UTF-8 whatever
     # the locale; the locale only decides whether emoji show.
